@@ -15,6 +15,27 @@ const formatTime12 = (dateObj) => {
 const App = () => {
   const [currentTime, setCurrentTime] = useState(new Date());
   const [zmanim, setZmanim] = useState(null);
+  const [tickerMessages, setTickerMessages] = useState(["טוען הודעות..."]); // Live state for ticker
+
+  // Real-time Firebase Ticker Listener
+  useEffect(() => {
+    const tickerRef = ref(db, 'ticker');
+    
+    const unsubscribe = onValue(tickerRef, (snapshot) => {
+      const data = snapshot.val();
+      if (data) {
+        if (typeof data === 'string') {
+          setTickerMessages([data]);
+        } else {
+          setTickerMessages(Object.values(data));
+        }
+      } else {
+        setTickerMessages(["אין הודעות חדשות"]);
+      }
+    });
+
+    return () => unsubscribe();
+  }, []);
 
   // Update real-time clock every minute
   useEffect(() => {
@@ -85,13 +106,6 @@ const App = () => {
     { label: "מנחה", time: "4:30 PM" },
     { label: "מעריב (א)", time: "5:15 PM" },
     { label: "מעריב (ב)", time: "8:30 PM" }
-  ];
-
-  const tickerMessages = [
-    "ברוכים הבאים לבית הכנסת",
-    "מזל טוב למשפחת כהן להולדת הבת",
-    "שיעור דף היומי מתחיל בשעה 8:00 בערב",
-    "נא לכבות טלפונים סלולריים"
   ];
 
   return (
