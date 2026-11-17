@@ -1,23 +1,267 @@
-import React, { useState, useEffect } from 'react';
-import { ref, onValue, push, remove } from 'firebase/database';
+import React, { useState, useEffect, useRef } from 'react';
+import { ref, onValue, push, remove, set, update } from 'firebase/database';
 import { signInWithEmailAndPassword, signOut, onAuthStateChanged } from 'firebase/auth';
 import { db, auth } from './firebase';
 
+/* =====================================================================
+   HELPERS
+   ===================================================================== */
+const pad = (n) => String(n).padStart(2, '0');
+
+const parseTimeStrToMinutes = (timeStr) => {
+  if (!timeStr) return 9999;
+  const match = String(timeStr).match(/(\d+):(\d+)\s*(AM|PM|am|pm)?/);
+  if (!match) return 9999;
+  let [, h, m, ampm] = match;
+  h = parseInt(h, 10);
+  m = parseInt(m, 10);
+  if (ampm) {
+    if (ampm.toLowerCase() === 'pm' && h < 12) h += 12;
+    if (ampm.toLowerCase() === 'am' && h === 12) h = 0;
+  }
+  return h * 60 + m;
+};
+
+// Turns "7pm", "7:00 p.m.", "19:00" into "7:00 PM". Hebrew text like "אחר מעריב" is allowed as text.
+const normalizeTime = (raw) => {
+  const s = String(raw || '').trim();
+  if (!s) return { ok: false, error: 'Enter a time.' };
+  if (/[\u0590-\u05FF]/.test(s) || !/\d/.test(s)) return { ok: 'text', value: s };
+  const m12 = s.match(/^(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m?\.?$/i);
+  if (m12) {
+    const h = parseInt(m12[1], 10), mi = m12[2] ? parseInt(m12[2], 10) : 0;
+    if (h < 1 || h > 12 || mi > 59) return { ok: false, error: 'That time is out of range.' };
+    return { ok: true, value: `${h}:${pad(mi)} ${m12[3].toUpperCase()}M` };
+  }
+  const m24 = s.match(/^(\d{1,2}):(\d{2})$/);
+  if (m24) {
+    const h = parseInt(m24[1], 10), mi = parseInt(m24[2], 10);
+    if (h > 23 || mi > 59) return { ok: false, error: 'That time is out of range.' };
+    if (h >= 13) return { ok: true, value: `${h - 12}:${pad(mi)} PM` };
+    if (h === 0) return { ok: true, value: `12:${pad(mi)} AM` };
+    return { ok: false, error: 'Add AM or PM (e.g. 7:00 PM), or use 24-hour time like 19:00.' };
+  }
+  return { ok: false, error: 'Use a format like 7:00 AM or 19:00.' };
+};
+
+// Returns the time to save, or null if the admin should fix it first.
+const resolveTime = (raw, onError) => {
+  const n = normalizeTime(raw);
+  if (n.ok === true) return n.value;
+  if (n.ok === 'text') {
+    return window.confirm(`"${n.value}" isn't a clock time, so it will be listed at the end of the schedule. Save it as text?`) ? n.value : null;
+  }
+  onError(n.error);
+  return null;
+};
+
+const isValidImageUrl = (u) => !u || /^https:\/\/[^'"()<>{}\\\s]+$/.test(u.trim());
+
+const localDateKey = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const nextSundayKey = () => {
+  const d = new Date();
+  d.setDate(d.getDate() + (((7 - d.getDay()) % 7) || 7));
+  return localDateKey(d);
+};
+
+const useNow = (ms) => {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => { const id = setInterval(() => setNow(Date.now()), ms); return () => clearInterval(id); }, [ms]);
+  return now;
+};
+
+// Small inline status message ("✓ Saved", errors)
+const useStatus = () => {
+  const [st, setSt] = useState(null);
+  const timer = useRef();
+  const show = (type, msg, ms) => {
+    clearTimeout(timer.current);
+    setSt(type ? { type, msg } : null);
+    if (type === 'ok') timer.current = setTimeout(() => setSt(null), ms || 2500);
+  };
+  useEffect(() => () => clearTimeout(timer.current), []);
+  return [st, show];
+};
+const StatusText = ({ st }) => (st ? <span className={`row-status ${st.type}`}>{st.msg}</span> : null);
+
+const DAY_OPTIONS = [
+  { value: 'erev', label: 'ליל שבת / ערב (Friday night)' },
+  { value: 'yom', label: 'יום שבת (Saturday)' }
+];
+const ROUND_OPTIONS = [
+  { value: 'down', label: 'Round earlier (5 min)' },
+  { value: 'nearest', label: 'Round nearest (5 min)' },
+  { value: 'up', label: 'Round later (5 min)' },
+  { value: 'none', label: 'Exact minute' }
+];
+const defaultRound = (base) => (base === 'shabbos_tzeis' ? 'none' : 'down');
+
+/* =====================================================================
+   ROW EDITORS
+   ===================================================================== */
+const ManualMinyanRow = ({ minyan, dbPath, withDay }) => {
+  const [lbl, setLbl] = useState(minyan.label || '');
+  const [tm, setTm] = useState(minyan.time || '');
+  const [st, show] = useStatus();
+  const savedDay = minyan.day === 'erev' ? 'erev' : 'yom';
+
+  useEffect(() => {
+    setLbl(minyan.label || '');
+    setTm(minyan.time || '');
+  }, [minyan.label, minyan.time]);
+
+  const write = (data) => set(ref(db, `${dbPath}/${minyan.id}`), data)
+    .then(() => show('ok', '✓ Saved'))
+    .catch(() => show('err', 'Save failed - check your connection or permissions.'));
+
+  const handleSave = () => {
+    if (lbl === (minyan.label || '') && tm === (minyan.time || '')) return;
+    if (!lbl.trim()) { show('err', "Name can't be empty."); setLbl(minyan.label || ''); return; }
+    const time = resolveTime(tm, (msg) => show('err', msg));
+    if (time === null) { if (normalizeTime(tm).ok === 'text') setTm(minyan.time || ''); return; }
+    setTm(time);
+    write({ label: lbl.trim(), time, ...(withDay ? { day: savedDay } : {}) });
+  };
+
+  const handleDayChange = (day) => write({ label: minyan.label || '', time: minyan.time || '', day });
+
+  const handleDelete = () => {
+    if (window.confirm(`Delete "${minyan.label} ${minyan.time}"?`)) remove(ref(db, `${dbPath}/${minyan.id}`));
+  };
+
+  const onKey = (e) => { if (e.key === 'Enter') e.target.blur(); };
+
+  return (
+    <li className="data-item" style={{ gap: '10px', flexWrap: 'wrap' }}>
+      <input value={lbl} onChange={e => setLbl(e.target.value)} onBlur={handleSave} onKeyDown={onKey} className="form-control" style={{ flex: 2, minWidth: '120px', background: 'transparent' }} dir="auto" />
+      <input value={tm} onChange={e => setTm(e.target.value)} onBlur={handleSave} onKeyDown={onKey} className="form-control" style={{ flex: 1, minWidth: '100px', background: 'transparent' }} dir="auto" />
+      {withDay && (
+        <select value={savedDay} onChange={e => handleDayChange(e.target.value)} className="form-control" style={{ flex: 1, minWidth: '150px', background: 'transparent', padding: '6px' }}>
+          {DAY_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+        </select>
+      )}
+      <StatusText st={st} />
+      <button onClick={handleDelete} className="btn btn-danger" style={{ padding: '8px 12px' }}>Delete</button>
+    </li>
+  );
+};
+
+const DynamicMinyanRow = ({ minyan }) => {
+  const [lbl, setLbl] = useState(minyan.label || '');
+  const [offset, setOffset] = useState(String(minyan.offset ?? ''));
+  const [st, show] = useStatus();
+  const base = minyan.base || 'friday_candle';
+  const round = minyan.round || defaultRound(base);
+
+  useEffect(() => {
+    setLbl(minyan.label || '');
+    setOffset(String(minyan.offset ?? ''));
+  }, [minyan.label, minyan.offset]);
+
+  const write = (data) => set(ref(db, `dynamic_rules/${minyan.id}`), data)
+    .then(() => show('ok', '✓ Saved'))
+    .catch(() => show('err', 'Save failed - check your connection or permissions.'));
+
+  const validOffset = () => offset.trim() !== '' && Number.isFinite(Number(offset));
+
+  const handleSave = () => {
+    if (lbl === (minyan.label || '') && offset === String(minyan.offset ?? '')) return;
+    if (!lbl.trim()) { show('err', "Name can't be empty."); setLbl(minyan.label || ''); return; }
+    if (!validOffset()) { show('err', 'Enter minutes, e.g. -20 or 15.'); setOffset(String(minyan.offset ?? '')); return; }
+    write({ label: lbl.trim(), base, offset: Number(offset), round });
+  };
+
+  const handleSelect = (changes) => write({
+    label: minyan.label || '', base, round,
+    offset: Number.isFinite(Number(minyan.offset)) ? Number(minyan.offset) : 0,
+    ...changes
+  });
+
+  const handleDelete = () => {
+    if (window.confirm(`Delete the rule "${minyan.label}"?`)) remove(ref(db, `dynamic_rules/${minyan.id}`));
+  };
+
+  const onKey = (e) => { if (e.key === 'Enter') e.target.blur(); };
+
+  return (
+    <li className="data-item" style={{ gap: '10px', flexWrap: 'wrap' }}>
+      <input value={lbl} onChange={e => setLbl(e.target.value)} onBlur={handleSave} onKeyDown={onKey} className="form-control" style={{ flex: 2, minWidth: '120px', background: 'transparent' }} dir="auto" />
+      <div style={{ flex: 4, display: 'flex', gap: '5px', alignItems: 'center', flexWrap: 'wrap' }}>
+        <input type="number" value={offset} onChange={e => setOffset(e.target.value)} onBlur={handleSave} onKeyDown={onKey} className="form-control" style={{ width: '70px', background: 'transparent', padding: '6px' }} />
+        <span style={{ fontSize: '13px', color: '#64748b' }}>mins from</span>
+        <select value={base} onChange={e => handleSelect({ base: e.target.value, round: minyan.round || defaultRound(e.target.value) })} className="form-control" style={{ flex: 1, minWidth: '110px', background: 'transparent', padding: '6px' }}>
+          <option value="friday_candle">Fri: Candles</option>
+          <option value="friday_shkia">Fri: Shkia</option>
+          <option value="shabbos_shkia">Shab: Shkia</option>
+          <option value="shabbos_tzeis">Shab: Tzeis</option>
+        </select>
+        <select value={round} onChange={e => handleSelect({ round: e.target.value })} className="form-control" style={{ flex: 1, minWidth: '140px', background: 'transparent', padding: '6px' }}>
+          {ROUND_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+        </select>
+      </div>
+      <StatusText st={st} />
+      <button onClick={handleDelete} className="btn btn-danger" style={{ padding: '8px 12px' }}>Delete</button>
+    </li>
+  );
+};
+
+/* =====================================================================
+   ADMIN
+   ===================================================================== */
 const Admin = () => {
-  // Firebase Auth State
   const [user, setUser] = useState(null);
   const [loadingAuth, setLoadingAuth] = useState(true);
-  
-  // Login Form State
+  const [isAdmin, setIsAdmin] = useState(null);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loginError, setLoginError] = useState("");
+  const now = useNow(30000);
 
-  // Database State
+  const [settings, setSettings] = useState({});
   const [messages, setMessages] = useState([]);
   const [newMessage, setNewMessage] = useState("");
 
-  // Listen for login status changes
+  const [manualMinyanim, setManualMinyanim] = useState([]);
+  const [minyanLabel, setMinyanLabel] = useState("");
+  const [minyanTime, setMinyanTime] = useState("");
+  const [manualSt, showManual] = useStatus();
+
+  const [shabbosMinyanim, setShabbosMinyanim] = useState([]);
+  const [shabbosLabel, setShabbosLabel] = useState("");
+  const [shabbosTime, setShabbosTime] = useState("");
+  const [shabbosDay, setShabbosDay] = useState("yom");
+  const [shabbosSt, showShabbos] = useStatus();
+
+  const [dynamicRules, setDynamicRules] = useState([]);
+  const [dynLabel, setDynLabel] = useState("");
+  const [dynBase, setDynBase] = useState("friday_candle");
+  const [dynOffset, setDynOffset] = useState("");
+  const [dynRound, setDynRound] = useState("down");
+  const [dynSt, showDyn] = useStatus();
+
+  const [seasonal, setSeasonal] = useState({ mashivHaruach: false, vtenTal: false });
+  const [overrides, setOverrides] = useState({ parsha: "", haftarah: "", daf: "", omer: "", candles: "", expires: "" });
+  const [overrideSt, showOverride] = useStatus();
+  const [tvStatus, setTvStatus] = useState(null);
+
+  // Settings form fields
+  const [zipInput, setZipInput] = useState("");
+  const [zipSt, showZip] = useStatus();
+  const [candleMinutes, setCandleMinutes] = useState("18");
+  const [klStartDays, setKlStartDays] = useState("3");
+  const [klEndOpinion, setKlEndOpinion] = useState("15days");
+  const [omerRollover, setOmerRollover] = useState("tzeis");
+  const [halachaSt, showHalacha] = useStatus();
+  const [shulName, setShulName] = useState("");
+  const [shulSubtitle, setShulSubtitle] = useState("");
+  const [logoUrl, setLogoUrl] = useState("");
+  const [mainBg, setMainBg] = useState("");
+  const [panelBg, setPanelBg] = useState("");
+  const [visualSt, showVisual] = useStatus();
+  const [simDate, setSimDate] = useState("");
+  const [simTime, setSimTime] = useState("");
+  const [simSt, showSim] = useStatus();
+
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
       setUser(currentUser);
@@ -26,127 +270,630 @@ const Admin = () => {
     return () => unsubscribe();
   }, []);
 
-  // Fetch data only if logged in
   useEffect(() => {
     if (!user) return;
+    const subs = [];
+    const listen = (path, fn) => subs.push(onValue(ref(db, path), (s) => fn(s.val()), () => {}));
 
-    const tickerRef = ref(db, 'ticker');
-    const unsubscribe = onValue(tickerRef, (snapshot) => {
-      const data = snapshot.val();
-      if (data) {
-        if (typeof data === 'string') {
-          setMessages([{ id: 'legacy', text: data }]);
-        } else {
-          const msgArray = Object.keys(data).map(key => ({ id: key, text: data[key] }));
-          setMessages(msgArray);
-        }
-      } else {
-        setMessages([]);
-      }
+    listen(`admins/${user.uid}`, (v) => setIsAdmin(v === true));
+    listen('settings', (v) => setSettings(v || {}));
+    listen('ticker', (data) => {
+      if (data) setMessages(typeof data === 'string' ? [{ id: 'legacy', text: data }] : Object.keys(data).map(key => ({ id: key, text: data[key] })));
+      else setMessages([]);
     });
-    return () => unsubscribe();
+    listen('manual_minyanim', (data) => {
+      const parsed = data ? Object.keys(data).map(key => ({ id: key, ...data[key] })) : [];
+      parsed.sort((a, b) => parseTimeStrToMinutes(a.time) - parseTimeStrToMinutes(b.time));
+      setManualMinyanim(parsed);
+    });
+    listen('shabbos_minyanim', (data) => {
+      const parsed = data ? Object.keys(data).map(key => ({ id: key, ...data[key] })) : [];
+      const rank = (d) => (d === 'erev' ? 0 : 1);
+      parsed.sort((a, b) => (rank(a.day) - rank(b.day)) || (parseTimeStrToMinutes(a.time) - parseTimeStrToMinutes(b.time)));
+      setShabbosMinyanim(parsed);
+    });
+    listen('dynamic_rules', (data) => setDynamicRules(data ? Object.keys(data).map(key => ({ id: key, ...data[key] })) : []));
+    listen('seasonal_tefillah', (data) => { if (data) setSeasonal(data); });
+    listen('overrides', (data) => setOverrides({ parsha: "", haftarah: "", daf: "", omer: "", candles: "", expires: "", ...(data || {}) }));
+    listen('system_logs/tv_status', (data) => setTvStatus(data || null));
+
+    return () => subs.forEach(u => u());
   }, [user]);
+
+  // Seed each form field only when its own setting changes, so typing in one card isn't overwritten
+  useEffect(() => { setZipInput(settings.zipCode || ""); }, [settings.zipCode]);
+  useEffect(() => { setCandleMinutes(String(settings.candleMinutes ?? 18)); }, [settings.candleMinutes]);
+  useEffect(() => { setKlStartDays(String(settings.klStartDays ?? 3)); }, [settings.klStartDays]);
+  useEffect(() => { setKlEndOpinion(settings.klEndOpinion || "15days"); }, [settings.klEndOpinion]);
+  useEffect(() => { setOmerRollover(settings.omerRollover || "tzeis"); }, [settings.omerRollover]);
+  useEffect(() => { setShulName(settings.shulName || ""); }, [settings.shulName]);
+  useEffect(() => { setShulSubtitle(settings.shulSubtitle ?? ""); }, [settings.shulSubtitle]);
+  useEffect(() => { setLogoUrl(settings.logoUrl || ""); }, [settings.logoUrl]);
+  useEffect(() => { setMainBg(settings.mainBg || ""); }, [settings.mainBg]);
+  useEffect(() => { setPanelBg(settings.panelBg || ""); }, [settings.panelBg]);
+  useEffect(() => {
+    const s = settings.simulation;
+    setSimDate((s && s.date) || "");
+    setSimTime((s && s.time) || "");
+  }, [settings.simulation]);
 
   const handleLogin = async (e) => {
     e.preventDefault();
     setLoginError("");
-    try {
-      await signInWithEmailAndPassword(auth, email, password);
-    } catch (err) {
-      setLoginError("Invalid email or password.");
-    }
+    try { await signInWithEmailAndPassword(auth, email, password); }
+    catch (err) { setLoginError("Invalid email or password."); }
   };
 
-  const handleLogout = async () => {
-    await signOut(auth);
-  };
-
-  const handleAdd = (e) => {
+  /* ---------- Add handlers ---------- */
+  const handleAddMessage = (e) => {
     e.preventDefault();
-    if (newMessage.trim() === "") return;
-    push(ref(db, 'ticker'), newMessage.trim()).catch(err => alert("Permission denied"));
+    if (!newMessage.trim()) return;
+    push(ref(db, 'ticker'), newMessage.trim());
     setNewMessage("");
   };
 
-  const handleDelete = (id) => {
-    const targetRef = id === 'legacy' ? ref(db, 'ticker') : ref(db, `ticker/${id}`);
-    remove(targetRef).catch(err => alert("Permission denied"));
+  const handleDeleteMessage = (msg) => {
+    if (!window.confirm(`Delete this announcement?\n\n${msg.text}`)) return;
+    remove(msg.id === 'legacy' ? ref(db, 'ticker') : ref(db, `ticker/${msg.id}`));
   };
 
-  if (loadingAuth) return <div style={{textAlign: 'center', marginTop: '50px'}}>Loading...</div>;
+  const handleAddManual = (e) => {
+    e.preventDefault();
+    if (!minyanLabel.trim()) return showManual('err', 'Enter a name.');
+    const time = resolveTime(minyanTime, (msg) => showManual('err', msg));
+    if (time === null) return;
+    push(ref(db, 'manual_minyanim'), { label: minyanLabel.trim(), time })
+      .then(() => showManual('ok', `✓ Added ${minyanLabel.trim()} ${time}`));
+    setMinyanLabel(""); setMinyanTime("");
+  };
 
-  // --- SECURE LOGIN SCREEN ---
+  const handleAddShabbos = (e) => {
+    e.preventDefault();
+    if (!shabbosLabel.trim()) return showShabbos('err', 'Enter a name.');
+    const time = resolveTime(shabbosTime, (msg) => showShabbos('err', msg));
+    if (time === null) return;
+    push(ref(db, 'shabbos_minyanim'), { label: shabbosLabel.trim(), time, day: shabbosDay })
+      .then(() => showShabbos('ok', `✓ Added ${shabbosLabel.trim()} ${time}`));
+    setShabbosLabel(""); setShabbosTime("");
+  };
+
+  const handleAddDynamic = (e) => {
+    e.preventDefault();
+    if (!dynLabel.trim()) return showDyn('err', 'Enter a name.');
+    if (dynOffset.trim() === '' || !Number.isFinite(Number(dynOffset))) return showDyn('err', 'Enter minutes, e.g. -20 or 15.');
+    push(ref(db, 'dynamic_rules'), { label: dynLabel.trim(), base: dynBase, offset: Number(dynOffset), round: dynRound })
+      .then(() => showDyn('ok', `✓ Added ${dynLabel.trim()}`));
+    setDynLabel(""); setDynOffset("");
+  };
+
+  const toggleMashiv = () => set(ref(db, 'seasonal_tefillah'), { ...seasonal, mashivHaruach: !seasonal.mashivHaruach });
+  const toggleVten = () => set(ref(db, 'seasonal_tefillah'), { ...seasonal, vtenTal: !seasonal.vtenTal });
+
+  /* ---------- Settings handlers ---------- */
+  const handleSaveZip = async (e) => {
+    e.preventDefault();
+    const z = zipInput.trim();
+    if (!/^\d{5}$/.test(z)) return showZip('err', 'Enter a 5-digit US zip code.');
+    showZip('info', 'Checking zip code with Hebcal...');
+    let data = null;
+    try {
+      const res = await fetch(`https://www.hebcal.com/zmanim?cfg=json&zip=${z}`);
+      data = await res.json();
+      if (!res.ok || data.error || !data.location) {
+        return showZip('err', `Hebcal doesn't recognize zip ${z}. Check the number and try again.`);
+      }
+    } catch (err) {
+      if (!window.confirm(`Couldn't reach Hebcal to verify zip ${z}. Save it anyway?`)) return showZip(null);
+    }
+    await set(ref(db, 'settings/zipCode'), z);
+    showZip('ok', data ? `✓ Location set to ${data.location.name}. The TV updates within a minute.` : `✓ Zip ${z} saved (not verified).`, 6000);
+  };
+
+  const handleSaveHalacha = (e) => {
+    e.preventDefault();
+    const mins = Number(candleMinutes);
+    if (!Number.isInteger(mins) || mins < 10 || mins > 60) return showHalacha('err', 'Candle lighting must be a whole number between 10 and 60 minutes.');
+    update(ref(db, 'settings'), {
+      candleMinutes: mins,
+      klStartDays: Number(klStartDays) === 7 ? 7 : 3,
+      klEndOpinion,
+      omerRollover
+    }).then(() => showHalacha('ok', '✓ Saved', 4000)).catch(() => showHalacha('err', 'Save failed.'));
+  };
+
+  const handleSaveVisuals = (e) => {
+    e.preventDefault();
+    const bad = [['Logo', logoUrl], ['Main background', mainBg], ['Panel background', panelBg]].filter(([, u]) => !isValidImageUrl(u));
+    if (bad.length) return showVisual('err', `${bad.map(b => b[0]).join(', ')}: use a direct https:// link with no spaces or quotes.`);
+    update(ref(db, 'settings'), {
+      shulName: shulName.trim(),
+      shulSubtitle: shulSubtitle.trim(),
+      logoUrl: logoUrl.trim(),
+      mainBg: mainBg.trim(),
+      panelBg: panelBg.trim()
+    }).then(() => showVisual('ok', '✓ Saved', 4000)).catch(() => showVisual('err', 'Save failed.'));
+  };
+
+  /* ---------- Overrides ---------- */
+  const handleSaveOverrides = (e) => {
+    e.preventDefault();
+    const fields = ['parsha', 'haftarah', 'daf', 'omer', 'candles'];
+    const clean = {};
+    fields.forEach(f => { clean[f] = (overrides[f] || '').trim(); });
+    const anySet = fields.some(f => clean[f]);
+    clean.expires = anySet ? (overrides.expires || nextSundayKey()) : '';
+    set(ref(db, 'overrides'), clean)
+      .then(() => showOverride('ok', anySet ? `✓ Saved. Overrides stop showing after ${clean.expires}.` : '✓ Saved.', 6000))
+      .catch(() => showOverride('err', 'Save failed.'));
+  };
+
+  const handleClearOverrides = () => {
+    if (!window.confirm('Clear all overrides and go back to automatic values?')) return;
+    remove(ref(db, 'overrides')).then(() => showOverride('ok', '✓ All overrides cleared.', 4000));
+  };
+
+  /* ---------- Simulation ---------- */
+  const sim = settings.simulation;
+  const simActive = !!(sim && sim.date && (!sim.expiresAt || now < sim.expiresAt));
+  const simExpired = !!(sim && sim.date && sim.expiresAt && now >= sim.expiresAt);
+
+  const handleSimulate = (e) => {
+    e.preventDefault();
+    if (!simDate) return showSim('err', 'Pick a date to simulate.');
+    const t = Date.now();
+    set(ref(db, 'settings/simulation'), { date: simDate, time: simTime || '12:00', setAt: t, expiresAt: t + 12 * 3600000 })
+      .then(() => { remove(ref(db, 'settings/simulationDate')); showSim('ok', '✓ The TV is now simulating that moment.', 4000); });
+  };
+
+  const handleClearSimulation = () => {
+    remove(ref(db, 'settings/simulation'));
+    remove(ref(db, 'settings/simulationDate'));
+    setSimDate(""); setSimTime("");
+  };
+
+  /* ---------- TV health ---------- */
+  const lastBeat = tvStatus && typeof tvStatus.lastUpdate === 'number' ? tvStatus.lastUpdate : null;
+  const beatAgeMin = lastBeat ? Math.max(0, Math.round((now - lastBeat) / 60000)) : null;
+  const tvStale = beatAgeMin !== null && beatAgeMin > 15;
+  const tvState = !tvStatus ? null : tvStale ? 'NOT RESPONDING' : (tvStatus.status || 'UNKNOWN');
+  const tvTone = tvState === 'OK' ? 'good' : (tvState === 'WARNING' || tvState === 'SIMULATION') ? 'warn' : 'bad';
+  const toneColors = {
+    good: { bg: '#ecfdf5', border: '#6ee7b7', text: '#059669' },
+    warn: { bg: '#fffbeb', border: '#fcd34d', text: '#b45309' },
+    bad: { bg: '#fef2f2', border: '#fca5a5', text: '#dc2626' }
+  }[tvTone];
+  const clockDriftMin = tvStatus && lastBeat && tvStatus.tvClock ? Math.round((tvStatus.tvClock - lastBeat) / 60000) : 0;
+
+  const overridesActive = !!overrides.expires && localDateKey(new Date()) <= overrides.expires;
+  const overridesExpired = !!overrides.expires && localDateKey(new Date()) > overrides.expires;
+
+  if (loadingAuth) return <div style={{ textAlign: 'center', marginTop: '50px', fontFamily: 'sans-serif' }}>Loading...</div>;
   if (!user) {
     return (
       <div style={{ padding: '50px 20px', fontFamily: 'sans-serif', maxWidth: '400px', margin: '0 auto', textAlign: 'center' }}>
         <h2>Secure Admin Login</h2>
-        <form onSubmit={handleLogin} style={{ display: 'flex', flexDirection: 'column', gap: '15px', marginTop: '20px' }}>
-          <input 
-            type="email" 
-            value={email} 
-            onChange={(e) => setEmail(e.target.value)} 
-            placeholder="Email address" 
-            style={{ padding: '12px', fontSize: '16px', border: '1px solid #ccc', borderRadius: '4px' }}
-            required
-          />
-          <input 
-            type="password" 
-            value={password} 
-            onChange={(e) => setPassword(e.target.value)} 
-            placeholder="Password" 
-            style={{ padding: '12px', fontSize: '16px', border: '1px solid #ccc', borderRadius: '4px' }}
-            required
-          />
+        <form onSubmit={handleLogin} style={{ display: 'flex', flexDirection: 'column', gap: '15px' }}>
+          <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email address" style={{ padding: '12px' }} required />
+          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" style={{ padding: '12px' }} required />
           {loginError && <p style={{ color: '#d32f2f', margin: 0 }}>{loginError}</p>}
-          <button type="submit" style={{ padding: '12px', fontSize: '16px', background: '#0d47a1', color: '#fff', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>
-            Login
-          </button>
+          <button type="submit" style={{ padding: '12px', background: '#0d47a1', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer' }}>Login</button>
         </form>
       </div>
     );
   }
 
-  // --- SECURE DASHBOARD SCREEN ---
   return (
-    <div style={{ padding: '20px', fontFamily: 'sans-serif', maxWidth: '600px', margin: '0 auto', direction: 'ltr', color: '#333' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '2px solid #eee', paddingBottom: '10px' }}>
-        <div>
-          <h2 style={{ margin: 0 }}>Admin Dashboard</h2>
-          <p style={{ margin: '5px 0 0 0', fontSize: '12px', color: '#666' }}>Logged in as: {user.email}</p>
-        </div>
-        <button onClick={handleLogout} style={{ background: '#eee', border: 'none', padding: '5px 10px', borderRadius: '4px', cursor: 'pointer' }}>
-          Logout
-        </button>
-      </div>
-      
-      <form onSubmit={handleAdd} style={{ display: 'flex', gap: '10px', marginBottom: '30px', marginTop: '20px' }}>
-        <input 
-          type="text" 
-          value={newMessage} 
-          onChange={(e) => setNewMessage(e.target.value)} 
-          placeholder="Type a new message..." 
-          dir="auto"
-          style={{ flex: 1, padding: '10px', fontSize: '16px', border: '1px solid #ccc', borderRadius: '4px' }}
-        />
-        <button type="submit" style={{ padding: '10px 20px', fontSize: '16px', background: '#0d47a1', color: '#fff', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>
-          Add
-        </button>
-      </form>
+    <>
+      <style>{`
+        .admin-bg { background-color: #f3f4f6; min-height: 100vh; padding: 30px 15px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: #1f2937; }
+        .admin-container { max-width: 900px; margin: 0 auto; }
+        .header-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; padding-bottom: 15px; border-bottom: 2px solid #e5e7eb; }
+        .header-bar h1 { margin: 0; font-size: 24px; color: #111827; }
+        .btn-logout { background: #e5e7eb; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: 600; color: #4b5563; }
+        .btn-logout:hover { background: #d1d5db; }
+        .card { background: #fff; border-radius: 12px; padding: 25px; margin-bottom: 25px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03); border: 1px solid #e5e7eb; }
+        .card h3 { margin: 0 0 15px 0; font-size: 20px; color: #111827; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid #f3f4f6; padding-bottom: 10px; }
+        .help-box { background: #eff6ff; border-left: 4px solid #3b82f6; padding: 12px 15px; border-radius: 0 8px 8px 0; font-size: 14px; color: #1e3a8a; margin-bottom: 20px; line-height: 1.5; }
+        .warn-box { background: #fffbeb; border: 1px solid #fcd34d; color: #92400e; padding: 12px 15px; border-radius: 8px; font-size: 14px; margin-bottom: 25px; line-height: 1.5; }
+        .form-row { display: flex; gap: 15px; margin-bottom: 15px; align-items: flex-end; flex-wrap: wrap; }
+        .form-group { display: flex; flex-direction: column; flex: 1; min-width: 150px; }
+        .form-group label { font-size: 13px; font-weight: 600; color: #4b5563; margin-bottom: 6px; }
+        .form-control { padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 15px; outline: none; transition: border-color 0.2s; }
+        .form-control:focus { border-color: #3b82f6; }
+        .btn { padding: 10px 20px; border: none; border-radius: 6px; font-size: 15px; font-weight: 600; cursor: pointer; transition: background 0.2s; height: 42px; }
+        .btn-primary { background: #2563eb; color: white; }
+        .btn-primary:hover { background: #1d4ed8; }
+        .btn-secondary { background: #e2e8f0; color: #475569; }
+        .btn-secondary:hover { background: #cbd5e1; }
+        .btn-danger { background: #fee2e2; color: #ef4444; border: 1px solid #f87171; height: auto; padding: 6px 12px; font-size: 13px; }
+        .btn-danger:hover { background: #fca5a5; color: #b91c1c; }
+        .toggle-group { display: flex; gap: 15px; flex-wrap: wrap; }
+        .toggle-btn { flex: 1; min-width: 150px; padding: 12px; border-radius: 8px; font-weight: 600; font-size: 15px; cursor: pointer; border: 2px solid transparent; transition: all 0.2s; background: #f3f4f6; color: #4b5563; }
+        .toggle-btn.active { background: #eff6ff; border-color: #3b82f6; color: #1d4ed8; box-shadow: 0 2px 4px rgba(59,130,246,0.1); }
+        .toggle-on { background: #10b981; color: white; box-shadow: 0 2px 4px rgba(16, 185, 129, 0.2); }
+        .toggle-off { background: #f3f4f6; color: #4b5563; border: 2px solid #e5e7eb; }
+        .data-list { list-style: none; padding: 0; margin: 0; }
+        .data-item { display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; margin-bottom: 8px; transition: border-color 0.2s; }
+        .data-item:hover { border-color: #94a3b8; }
+        .sim-card { background: #fef2f2; border: 2px solid #ef4444; }
+        .sim-active-title { color: #dc2626 !important; }
+        .row-status { font-size: 13px; font-weight: 600; white-space: nowrap; }
+        .row-status.ok { color: #059669; }
+        .row-status.err { color: #dc2626; white-space: normal; }
+        .row-status.info { color: #2563eb; }
+        .card-status { margin-top: 10px; display: block; }
+        .health-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; color: #4b5563; gap: 10px; }
+      `}</style>
 
-      <ul style={{ listStyle: 'none', padding: 0 }}>
-        {messages.length === 0 && (
-          <li style={{ textAlign: 'center', color: '#777', marginTop: '20px' }}>No messages currently active.</li>
-        )}
-        {messages.map((msg) => (
-          <li key={msg.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '15px', background: '#f5f5f5', marginBottom: '10px', borderRadius: '4px', border: '1px solid #ddd' }}>
-            <span style={{ fontSize: '18px' }} dir="auto">{msg.text}</span>
-            <button onClick={() => handleDelete(msg.id)} style={{ background: '#d32f2f', color: '#fff', border: 'none', padding: '8px 15px', borderRadius: '4px', cursor: 'pointer', marginLeft: '15px' }}>
-              Delete
-            </button>
-          </li>
-        ))}
-      </ul>
-    </div>
+      <div className="admin-bg">
+        <div className="admin-container">
+
+          <div className="header-bar">
+            <h1>Shul Board Admin</h1>
+            <button className="btn-logout" onClick={() => signOut(auth)}>Logout</button>
+          </div>
+
+          {isAdmin === false && (
+            <div className="warn-box">
+              <strong>This account isn't on the admin list.</strong> Once the database security rules are published, changes from this account will be blocked.
+              To authorize it, open the Firebase console → Realtime Database and add <code>admins/{user.uid}: true</code>.
+            </div>
+          )}
+
+          {/* ===== TV HEALTH ===== */}
+          <div className="card" style={{ background: '#f8fafc', borderColor: '#cbd5e1' }}>
+            <h3 style={{ color: '#0f172a' }}>📡 TV System Health</h3>
+            {tvStatus ? (
+              <div style={{ padding: '15px', background: toneColors.bg, border: `1px solid ${toneColors.border}`, borderRadius: '8px' }}>
+                <div className="health-row" style={{ fontSize: '15px' }}>
+                  <strong>Status:</strong>
+                  <span style={{ color: toneColors.text, fontWeight: 'bold' }}>{tvState}</span>
+                </div>
+                <div className="health-row">
+                  <strong>Last heartbeat:</strong>
+                  <span>{lastBeat ? `${new Date(lastBeat).toLocaleString()} (${beatAgeMin === 0 ? 'just now' : `${beatAgeMin} min ago`})` : 'unknown'}</span>
+                </div>
+                <div className="health-row"><strong>Board date:</strong> <span>{tvStatus.activeDate}</span></div>
+                {tvStatus.location && <div className="health-row"><strong>Location:</strong> <span>{tvStatus.location}</span></div>}
+                {tvStale && (
+                  <div className="health-row" style={{ color: '#dc2626' }}>
+                    The TV hasn't checked in for over 15 minutes. Check that it's powered on and connected to the internet.
+                  </div>
+                )}
+                {Math.abs(clockDriftMin) >= 2 && !tvStale && (
+                  <div className="health-row" style={{ color: '#b45309' }}>
+                    The TV's clock is off by about {Math.abs(clockDriftMin)} minutes. Fix the date and time settings on the TV device.
+                  </div>
+                )}
+                <div style={{ fontSize: '14px', color: '#4b5563', marginTop: '10px', padding: '10px', background: '#fff', borderRadius: '4px', border: '1px solid #e2e8f0' }}>
+                  <strong>Message:</strong> {tvStatus.message}
+                </div>
+              </div>
+            ) : (
+              <p style={{ color: '#64748b' }}>Waiting for the TV to check in. If this doesn't change within 5 minutes, open the board on the TV.</p>
+            )}
+          </div>
+
+          {/* ===== SIMULATION ===== */}
+          <div className={`card ${simActive ? 'sim-card' : ''}`}>
+            <h3 className={simActive ? 'sim-active-title' : ''}>
+              {simActive ? "⚠️ Simulation Mode Active" : "🧪 Testing & Simulation"}
+            </h3>
+            <div className="help-box">
+              Jump the TV to any date and time to test zmanim, Shkia rollovers, fast days and Shabbos layouts.
+              The simulated clock keeps running from the time you choose, so you can watch Shkia or Tzeis pass.
+              Simulation turns itself off after 12 hours.
+            </div>
+            {simActive && (
+              <p style={{ color: '#dc2626', fontWeight: 600, marginTop: 0 }}>
+                Simulating {sim.date} from {sim.time}. Turns off automatically at {new Date(sim.expiresAt).toLocaleString()}.
+              </p>
+            )}
+            {simExpired && (
+              <p style={{ color: '#b45309', fontWeight: 600, marginTop: 0 }}>
+                The last simulation expired and the TV is back on the real date. Clear it to tidy up.
+              </p>
+            )}
+            <form onSubmit={handleSimulate} className="form-row">
+              <div className="form-group" style={{ flex: 2 }}>
+                <label>Date</label>
+                <input type="date" value={simDate} onChange={(e) => setSimDate(e.target.value)} className="form-control" />
+              </div>
+              <div className="form-group" style={{ flex: 1 }}>
+                <label>Starting time (shul time)</label>
+                <input type="time" value={simTime} onChange={(e) => setSimTime(e.target.value)} className="form-control" />
+              </div>
+              <button type="submit" className="btn btn-primary">Simulate</button>
+              {(simActive || simExpired) && (
+                <button type="button" onClick={handleClearSimulation} className="btn" style={{ background: '#ef4444', color: 'white' }}>Back to Real Time</button>
+              )}
+            </form>
+            <StatusText st={simSt} />
+          </div>
+
+          {/* ===== LOCATION & HALACHIC SETTINGS ===== */}
+          <div className="card">
+            <h3>🌍 Location & Halachic Settings</h3>
+            <form onSubmit={handleSaveZip} className="form-row" style={{ marginBottom: '10px' }}>
+              <div className="form-group" style={{ flex: 2 }}>
+                <label>Shul Zip Code</label>
+                <input type="text" inputMode="numeric" value={zipInput} onChange={(e) => setZipInput(e.target.value)} placeholder="e.g. 10001" className="form-control" required />
+              </div>
+              <button type="submit" className="btn btn-primary">Update Location</button>
+            </form>
+            <StatusText st={zipSt} />
+
+            <form onSubmit={handleSaveHalacha} style={{ marginTop: '20px', borderTop: '1px solid #f3f4f6', paddingTop: '20px' }}>
+              <div className="form-row">
+                <div className="form-group">
+                  <label>Candle lighting (minutes before Shkia)</label>
+                  <input type="number" min="10" max="60" value={candleMinutes} onChange={(e) => setCandleMinutes(e.target.value)} className="form-control" />
+                </div>
+                <div className="form-group">
+                  <label>Omer count changes at</label>
+                  <select value={omerRollover} onChange={(e) => setOmerRollover(e.target.value)} className="form-control">
+                    <option value="tzeis">Tzeis (nightfall)</option>
+                    <option value="shkia">Shkia (sunset)</option>
+                  </select>
+                </div>
+              </div>
+              <div className="form-row">
+                <div className="form-group">
+                  <label>Kiddush Levana begins</label>
+                  <select value={klStartDays} onChange={(e) => setKlStartDays(e.target.value)} className="form-control">
+                    <option value="3">3 days after the molad</option>
+                    <option value="7">7 days after the molad</option>
+                  </select>
+                </div>
+                <div className="form-group">
+                  <label>Kiddush Levana ends</label>
+                  <select value={klEndOpinion} onChange={(e) => setKlEndOpinion(e.target.value)} className="form-control">
+                    <option value="15days">15 days after the molad (Rema)</option>
+                    <option value="between_moldos">Halfway between moldos, 14d 18h 22m (Mechaber)</option>
+                  </select>
+                </div>
+              </div>
+              <button type="submit" className="btn btn-primary">Save Halachic Settings</button>
+              <StatusText st={halachaSt} />
+            </form>
+          </div>
+
+          {/* ===== DISPLAY ===== */}
+          <div className="card">
+            <h3>🎨 Display</h3>
+            <label style={{ fontSize: '13px', fontWeight: 600, color: '#4b5563', display: 'block', marginBottom: '8px' }}>Select Decor Theme:</label>
+            <div className="toggle-group" style={{ marginBottom: '20px' }}>
+              <button onClick={() => set(ref(db, 'settings/theme'), 'dark')} className={`toggle-btn ${settings.theme === 'dark' || !settings.theme ? 'active' : ''}`}>🌙 Modern Dark</button>
+              <button onClick={() => set(ref(db, 'settings/theme'), 'light')} className={`toggle-btn ${settings.theme === 'light' ? 'active' : ''}`}>☀️ Modern Light</button>
+              <button onClick={() => set(ref(db, 'settings/theme'), 'marble')} className={`toggle-btn ${settings.theme === 'marble' ? 'active' : ''}`}>🏛️ Gold & Marble</button>
+              <button onClick={() => set(ref(db, 'settings/theme'), 'wood')} className={`toggle-btn ${settings.theme === 'wood' ? 'active' : ''}`}>🌲 Natural Wood</button>
+            </div>
+
+            <label style={{ fontSize: '13px', fontWeight: 600, color: '#4b5563', display: 'block', marginBottom: '8px' }}>Select Font Style:</label>
+            <div className="toggle-group" style={{ marginBottom: '25px', borderBottom: '1px solid #f3f4f6', paddingBottom: '20px' }}>
+              <button onClick={() => set(ref(db, 'settings/font'), 'Heebo')} className={`toggle-btn ${settings.font === 'Heebo' || !settings.font ? 'active' : ''}`}>Heebo (Clean & Modern)</button>
+              <button onClick={() => set(ref(db, 'settings/font'), 'Rubik')} className={`toggle-btn ${settings.font === 'Rubik' ? 'active' : ''}`}>Rubik (Soft & Rounded)</button>
+              <button onClick={() => set(ref(db, 'settings/font'), 'Frank Ruhl Libre')} className={`toggle-btn ${settings.font === 'Frank Ruhl Libre' ? 'active' : ''}`}>Frank Ruhl (Classic Serif)</button>
+            </div>
+
+            <div className="help-box">
+              Image links must start with <code>https://</code> and point directly to an image file. Leave a field empty to use the built-in look.
+            </div>
+            <form onSubmit={handleSaveVisuals} style={{ marginBottom: '25px', borderBottom: '1px solid #f3f4f6', paddingBottom: '20px' }}>
+              <div className="form-row">
+                <div className="form-group">
+                  <label>Shul Name</label>
+                  <input type="text" value={shulName} onChange={(e) => setShulName(e.target.value)} placeholder="בית כנסת אוהל משה" dir="auto" className="form-control" />
+                </div>
+                <div className="form-group">
+                  <label>Subtitle</label>
+                  <input type="text" value={shulSubtitle} onChange={(e) => setShulSubtitle(e.target.value)} placeholder="קהילת קודש" dir="auto" className="form-control" />
+                </div>
+              </div>
+              <div className="form-row">
+                <div className="form-group" style={{ minWidth: '200px' }}>
+                  <label>Shul Logo URL</label>
+                  <input type="text" value={logoUrl} onChange={(e) => setLogoUrl(e.target.value)} placeholder="https://..." className="form-control" />
+                </div>
+                <div className="form-group" style={{ minWidth: '200px' }}>
+                  <label>Main Background URL</label>
+                  <input type="text" value={mainBg} onChange={(e) => setMainBg(e.target.value)} placeholder="https://..." className="form-control" />
+                </div>
+                <div className="form-group" style={{ minWidth: '200px' }}>
+                  <label>Panels Background URL</label>
+                  <input type="text" value={panelBg} onChange={(e) => setPanelBg(e.target.value)} placeholder="https://..." className="form-control" />
+                </div>
+              </div>
+              <button type="submit" className="btn btn-primary" style={{ background: '#4f46e5' }}>Save Name & Visuals</button>
+              <StatusText st={visualSt} />
+            </form>
+
+            <label style={{ fontSize: '13px', fontWeight: 600, color: '#4b5563', display: 'block', marginBottom: '8px' }}>Seasonal Tefillah Inserts:</label>
+            <div className="toggle-group">
+              <button onClick={toggleMashiv} className={`toggle-btn ${seasonal.mashivHaruach ? 'toggle-on' : 'toggle-off'}`}>
+                {seasonal.mashivHaruach ? "✓ משיב הרוח" : "מוריד הטל"}
+              </button>
+              <button onClick={toggleVten} className={`toggle-btn ${seasonal.vtenTal ? 'toggle-on' : 'toggle-off'}`}>
+                {seasonal.vtenTal ? "✓ ותן טל ומטר" : "ברכנו"}
+              </button>
+            </div>
+          </div>
+
+          {/* ===== WEEKDAY SCHEDULE ===== */}
+          <div className="card">
+            <h3>📅 Weekday Schedule</h3>
+            <div className="help-box">
+              Shown Sunday through Friday midday. Type times like <code>7:00 AM</code>, <code>7pm</code> or <code>19:00</code>. Changes save when you click away or press Enter.
+            </div>
+
+            <div style={{ marginBottom: '15px', display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+              <span style={{ fontSize: '13px', fontWeight: 600, color: '#4b5563', alignSelf: 'center' }}>Quick Fill:</span>
+              <button type="button" onClick={() => { setMinyanLabel('שחרית'); setMinyanTime('7:00 AM'); }} className="btn btn-secondary" style={{ fontSize: '13px', padding: '6px 12px', height: 'auto' }}>שחרית 7:00</button>
+              <button type="button" onClick={() => { setMinyanLabel('שחרית'); setMinyanTime('8:00 AM'); }} className="btn btn-secondary" style={{ fontSize: '13px', padding: '6px 12px', height: 'auto' }}>שחרית 8:00</button>
+              <button type="button" onClick={() => { setMinyanLabel('מנחה'); setMinyanTime('6:00 PM'); }} className="btn btn-secondary" style={{ fontSize: '13px', padding: '6px 12px', height: 'auto' }}>מנחה 6:00</button>
+              <button type="button" onClick={() => { setMinyanLabel('מעריב'); setMinyanTime('10:00 PM'); }} className="btn btn-secondary" style={{ fontSize: '13px', padding: '6px 12px', height: 'auto' }}>מעריב 10:00</button>
+            </div>
+
+            <form onSubmit={handleAddManual} className="form-row">
+              <div className="form-group" style={{ flex: 2 }}>
+                <label>Minyan Name</label>
+                <input type="text" value={minyanLabel} onChange={(e) => setMinyanLabel(e.target.value)} placeholder="e.g. שחרית" dir="auto" className="form-control" required />
+              </div>
+              <div className="form-group" style={{ flex: 1 }}>
+                <label>Time</label>
+                <input type="text" value={minyanTime} onChange={(e) => setMinyanTime(e.target.value)} placeholder="e.g. 6:30 AM" dir="auto" className="form-control" required />
+              </div>
+              <button type="submit" className="btn btn-primary">Add</button>
+            </form>
+            <StatusText st={manualSt} />
+
+            <ul className="data-list" style={{ marginTop: '10px' }}>
+              {manualMinyanim.map((m) => (
+                <ManualMinyanRow key={m.id} minyan={m} dbPath="manual_minyanim" />
+              ))}
+            </ul>
+          </div>
+
+          {/* ===== SHABBOS FIXED ===== */}
+          <div className="card">
+            <h3>🍷 Shabbos Schedule (Fixed Times)</h3>
+            <div className="help-box">
+              Choose whether each minyan is Friday night or Saturday, so the board lists Friday night first.
+              Older entries without a day are treated as Saturday; set the day on any Friday-night entries below.
+            </div>
+
+            <div style={{ marginBottom: '15px', display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+              <span style={{ fontSize: '13px', fontWeight: 600, color: '#4b5563', alignSelf: 'center' }}>Quick Fill:</span>
+              <button type="button" onClick={() => { setShabbosLabel('שחרית'); setShabbosTime('9:00 AM'); setShabbosDay('yom'); }} className="btn btn-secondary" style={{ fontSize: '13px', padding: '6px 12px', height: 'auto' }}>שחרית 9:00</button>
+              <button type="button" onClick={() => { setShabbosLabel('מנחה גדולה'); setShabbosTime('1:30 PM'); setShabbosDay('yom'); }} className="btn btn-secondary" style={{ fontSize: '13px', padding: '6px 12px', height: 'auto' }}>מנחה גדולה 1:30</button>
+            </div>
+
+            <form onSubmit={handleAddShabbos} className="form-row">
+              <div className="form-group" style={{ flex: 2 }}>
+                <label>Minyan Name</label>
+                <input type="text" value={shabbosLabel} onChange={(e) => setShabbosLabel(e.target.value)} placeholder="e.g. שחרית" dir="auto" className="form-control" required />
+              </div>
+              <div className="form-group" style={{ flex: 1 }}>
+                <label>Time</label>
+                <input type="text" value={shabbosTime} onChange={(e) => setShabbosTime(e.target.value)} placeholder="e.g. 9:00 AM" dir="auto" className="form-control" required />
+              </div>
+              <div className="form-group" style={{ flex: 1.5 }}>
+                <label>Day</label>
+                <select value={shabbosDay} onChange={(e) => setShabbosDay(e.target.value)} className="form-control">
+                  {DAY_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                </select>
+              </div>
+              <button type="submit" className="btn btn-primary">Add</button>
+            </form>
+            <StatusText st={shabbosSt} />
+
+            <ul className="data-list" style={{ marginTop: '10px' }}>
+              {shabbosMinyanim.map((m) => (
+                <ManualMinyanRow key={m.id} minyan={m} dbPath="shabbos_minyanim" withDay />
+              ))}
+            </ul>
+          </div>
+
+          {/* ===== DYNAMIC ===== */}
+          <div className="card">
+            <h3>⚙️ Shabbos & Yom Tov (Dynamic)</h3>
+            <div className="help-box">
+              These times are calculated from candle lighting, Shkia or Tzeis each week. For Yom Tov, "Fri" anchors use Erev Yom Tov,
+              "Shab: Shkia" uses Shabbos (or the first day of Yom Tov), and "Shab: Tzeis" uses the last day.
+              Times anchored to Shkia round earlier by default so a minyan is never listed later than the rule allows.
+            </div>
+
+            <form onSubmit={handleAddDynamic} className="form-row">
+              <div className="form-group" style={{ flex: 2 }}>
+                <label>Minyan Name</label>
+                <input type="text" value={dynLabel} onChange={(e) => setDynLabel(e.target.value)} placeholder="e.g. מנחה" dir="auto" className="form-control" required />
+              </div>
+              <div className="form-group" style={{ flex: 2 }}>
+                <label>Anchor Time</label>
+                <select value={dynBase} onChange={(e) => { setDynBase(e.target.value); setDynRound(defaultRound(e.target.value)); }} className="form-control">
+                  <option value="friday_candle">Friday: Candle Lighting</option>
+                  <option value="friday_shkia">Friday: Shkia</option>
+                  <option value="shabbos_shkia">Shabbos: Shkia</option>
+                  <option value="shabbos_tzeis">Shabbos: Tzeis</option>
+                </select>
+              </div>
+              <div className="form-group" style={{ flex: 1 }}>
+                <label>Minutes</label>
+                <input type="number" value={dynOffset} onChange={(e) => setDynOffset(e.target.value)} placeholder="-40 or 15" className="form-control" required />
+              </div>
+              <div className="form-group" style={{ flex: 2 }}>
+                <label>Rounding</label>
+                <select value={dynRound} onChange={(e) => setDynRound(e.target.value)} className="form-control">
+                  {ROUND_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                </select>
+              </div>
+              <button type="submit" className="btn btn-primary">Add</button>
+            </form>
+            <StatusText st={dynSt} />
+
+            <ul className="data-list" style={{ marginTop: '10px' }}>
+              {dynamicRules.map((m) => (
+                <DynamicMinyanRow key={m.id} minyan={m} />
+              ))}
+            </ul>
+          </div>
+
+          {/* ===== TICKER ===== */}
+          <div className="card">
+            <h3>💬 Scrolling Announcements</h3>
+            <form onSubmit={handleAddMessage} className="form-row">
+              <div className="form-group">
+                <label>New Message</label>
+                <input type="text" value={newMessage} onChange={(e) => setNewMessage(e.target.value)} placeholder="Type a new announcement..." dir="auto" className="form-control" />
+              </div>
+              <button type="submit" className="btn btn-primary">Add</button>
+            </form>
+
+            <ul className="data-list">
+              {messages.map((msg) => (
+                <li key={msg.id} className="data-item">
+                  <span className="data-text" dir="auto">{msg.text}</span>
+                  <button onClick={() => handleDeleteMessage(msg)} className="btn btn-danger">Delete</button>
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          {/* ===== OVERRIDES ===== */}
+          <div className="card" style={{ background: '#fffbeb', border: '1px solid #fde68a' }}>
+            <h3 style={{ color: '#d97706' }}>🛠️ Manual Overrides (Emergency Use)</h3>
+            <div className="help-box" style={{ background: '#fff7ed', borderColor: '#f59e0b', color: '#7c2d12' }}>
+              Overrides replace the automatic values until the date you choose (next Sunday by default), then the board goes back to automatic.
+              {overridesActive && <><br /><strong>Active until {overrides.expires}.</strong></>}
+              {overridesExpired && <><br /><strong>Expired on {overrides.expires} - the board is ignoring them.</strong></>}
+            </div>
+            <form onSubmit={handleSaveOverrides}>
+              <div className="form-row">
+                <div className="form-group"><label>Parsha Override</label><input type="text" value={overrides.parsha} onChange={(e) => setOverrides({ ...overrides, parsha: e.target.value })} placeholder="Auto" dir="auto" className="form-control" /></div>
+                <div className="form-group"><label>Haftarah Override</label><input type="text" value={overrides.haftarah} onChange={(e) => setOverrides({ ...overrides, haftarah: e.target.value })} placeholder="Auto" dir="auto" className="form-control" /></div>
+              </div>
+              <div className="form-row">
+                <div className="form-group"><label>Daf Yomi Override</label><input type="text" value={overrides.daf} onChange={(e) => setOverrides({ ...overrides, daf: e.target.value })} placeholder="Auto" dir="auto" className="form-control" /></div>
+                <div className="form-group"><label>Omer Override</label><input type="text" value={overrides.omer} onChange={(e) => setOverrides({ ...overrides, omer: e.target.value })} placeholder="Auto" dir="auto" className="form-control" /></div>
+                <div className="form-group"><label>Candle Lighting Override</label><input type="text" value={overrides.candles} onChange={(e) => setOverrides({ ...overrides, candles: e.target.value })} placeholder="Auto" dir="auto" className="form-control" /></div>
+              </div>
+              <div className="form-row">
+                <div className="form-group" style={{ maxWidth: '250px' }}>
+                  <label>Show overrides through</label>
+                  <input type="date" value={overrides.expires || ''} onChange={(e) => setOverrides({ ...overrides, expires: e.target.value })} className="form-control" />
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center' }}>
+                <button type="submit" className="btn btn-primary" style={{ background: '#d97706' }}>Save Overrides</button>
+                <button type="button" onClick={handleClearOverrides} className="btn btn-secondary">Clear All Overrides</button>
+                <StatusText st={overrideSt} />
+              </div>
+            </form>
+          </div>
+
+        </div>
+      </div>
+    </>
   );
 };
 
