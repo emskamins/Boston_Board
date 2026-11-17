@@ -1,11 +1,14 @@
 import React, { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback } from 'react';
 import { ref, onValue, set, onDisconnect, serverTimestamp } from "firebase/database";
 import { db } from './firebase';
+import { HebrewCalendar, Location, Zmanim, HDate, months } from '@hebcal/core';
+import '@hebcal/learning'; // registers Daf Yomi with @hebcal/core
+import { eventToClassicApiObject } from '@hebcal/rest-api';
 
 /* =====================================================================
    CONSTANTS
    ===================================================================== */
-const CACHE_PREFIX = 'shulBoardCacheV23';     // Hebcal cache (keyed by zip + candle minutes)
+const LOC_CACHE_PREFIX = 'shulBoardLocation:'; // legacy zip -> coordinates lookup (one time)
 const FB_CACHE_PREFIX = 'shulBoardFb:';       // Firebase snapshot cache (per path)
 const DAY_NAMES = ["א׳", "ב׳", "ג׳", "ד׳", "ה׳", "ו׳", "שבת"];
 const BROWSER_TZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -13,7 +16,8 @@ const ALLOWED_FONTS = ['Heebo', 'Rubik', 'Frank Ruhl Libre'];
 const ALLOWED_THEMES = ['dark', 'light', 'marble', 'wood'];
 const EMPTY_OBJ = {};
 
-try { localStorage.removeItem('shulBoardCacheV22'); } catch (e) { /* ignore */ }
+// Old Hebcal API caches are no longer needed - the calendar is calculated on the device
+try { Object.keys(localStorage).filter(k => k.startsWith('shulBoardCacheV2')).forEach(k => localStorage.removeItem(k)); } catch (e) { /* ignore */ }
 
 /* =====================================================================
    DATE / TIME HELPERS (all calculated in the SHUL's time zone)
@@ -184,6 +188,107 @@ const isTishaBav = (e) => /^Tish.a B.Av/i.test(e.title || '');
 const isFastEvent = (e) => (e.category === 'holiday' && (e.subcat === 'fast' || isTishaBav(e))) || isYomKippur(e);
 
 /* =====================================================================
+   LOCAL CALENDAR ENGINE (@hebcal/core - no internet needed)
+   Produces the same shape the Hebcal web API returned, so the board
+   logic below is unchanged.
+   ===================================================================== */
+// End-of-window zmanim round earlier, start-of-window zmanim round later
+const ZMAN_ROUNDING = {
+  alotHaShachar: 'up', sunrise: 'up', sofZmanShma: 'down', sofZmanShmaMGA: 'down',
+  chatzot: 'nearest', minchaGedola: 'up', minchaKetana: 'up', plagHaMincha: 'up',
+  sunset: 'down', tzeit7083deg: 'up', tzeit85deg: 'up'
+};
+
+const roundToMinute = (d, mode) => {
+  if (!d || isNaN(d.getTime())) return null;
+  const t = d.getTime(), step = 60000;
+  if (mode === 'down') return new Date(Math.floor(t / step) * step);
+  if (mode === 'up') return new Date(Math.ceil(t / step) * step);
+  return new Date(Math.round(t / step) * step);
+};
+
+const localDateOfKey = (key) => { const [y, m, d] = key.split('-').map(Number); return new Date(y, m - 1, d, 12, 0, 0); };
+
+const validLocation = (loc) => !!loc
+  && Number.isFinite(Number(loc.latitude)) && Number.isFinite(Number(loc.longitude))
+  && typeof loc.tzid === 'string' && loc.tzid.length > 0;
+
+function buildCalendar({ loc, il, candleMins, startKey, endKey }) {
+  const location = new Location(Number(loc.latitude), Number(loc.longitude), il, loc.tzid, loc.name || '');
+  const options = {
+    start: localDateOfKey(startKey),
+    end: localDateOfKey(endKey),
+    location,
+    il,
+    candlelighting: true,
+    candleLightingMins: candleMins,
+    havdalahDeg: 8.5,
+    sedrot: true,
+    omer: true,
+    addHebrewDates: true,
+    dailyLearning: { dafYomi: true },
+    ashkenazi: true,
+    noModern: true
+  };
+  const events = HebrewCalendar.calendar(options).map(ev => eventToClassicApiObject(ev, options, true));
+
+  const times = {};
+  for (let k = startKey; k <= endKey; k = addDays(k, 1)) {
+    const z = new Zmanim(location, localDateOfKey(k), false);
+    const raw = {
+      alotHaShachar: z.alotHaShachar(), sunrise: z.sunrise(),
+      sofZmanShma: z.sofZmanShma(), sofZmanShmaMGA: z.sofZmanShmaMGA(),
+      chatzot: z.chatzot(), minchaGedola: z.minchaGedola(), minchaKetana: z.minchaKetana(),
+      plagHaMincha: z.plagHaMincha(), sunset: z.sunset(),
+      tzeit7083deg: z.tzeit(7.083), tzeit85deg: z.tzeit(8.5)
+    };
+    times[k] = {};
+    Object.entries(raw).forEach(([name, d]) => {
+      const r = roundToMinute(d, ZMAN_ROUNDING[name]);
+      if (r) times[k][name] = Zmanim.formatISOWithTimeZone(loc.tzid, r);
+    });
+  }
+  return { tzid: loc.tzid, locationName: loc.name || '', il, times, events, timestamp: Date.now() };
+}
+
+/* =====================================================================
+   SEASONAL TEFILLAH (automatic)
+   ===================================================================== */
+const hdOfKey = (key) => new HDate(localDateOfKey(key));
+const isCivilLeap = (y) => (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+
+// Mashiv HaRuach: Musaf of Shemini Atzeres (22 Tishrei) until Musaf of the 1st day of Pesach
+const mashivOn = (key) => {
+  const hd = hdOfKey(key), m = hd.getMonth(), d = hd.getDate();
+  return (m === months.TISHREI && d >= 22) || m >= months.CHESHVAN || (m === months.NISAN && d < 15);
+};
+
+// V'sen Tal U'matar: Israel from Maariv of 7 Cheshvan; Diaspora from Maariv of Dec 4
+// (Dec 5 in the year before a civil leap year). Ends with Mincha of Erev Pesach.
+// Keys are halachic days, so the first day is the one that begins at that Maariv.
+const vtenOn = (key, il) => {
+  const hd = hdOfKey(key), m = hd.getMonth(), d = hd.getDate();
+  if (il) return (m === months.CHESHVAN && d >= 7) || m >= months.KISLEV || (m === months.NISAN && d < 15);
+  const [y, mo] = key.split('-').map(Number);
+  if (mo >= 9) return key >= `${y}-12-${isCivilLeap(y + 1) ? '06' : '05'}`;
+  return m >= months.TEVET || (m === months.NISAN && d < 15);
+};
+
+/* =====================================================================
+   WEEKDAY DYNAMIC ANCHORS
+   ===================================================================== */
+const WEEKDAY_ANCHORS = {
+  alos: 'alotHaShachar', netz: 'sunrise', chatzos: 'chatzot',
+  mincha_gedola: 'minchaGedola', mincha_ketana: 'minchaKetana', plag: 'plagHaMincha',
+  shkia: 'sunset', tzeis: 'tzeit7083deg', tzeis85: 'tzeit85deg'
+};
+const ruleDays = (rule) => {
+  const raw = rule.days;
+  const list = Array.isArray(raw) ? raw : (raw && typeof raw === 'object' ? Object.values(raw) : [0, 1, 2, 3, 4]);
+  return list.map(Number).filter(n => n >= 0 && n <= 6);
+};
+
+/* =====================================================================
    FIREBASE HOOK - live listener + localStorage snapshot so the board
    still shows minyanim after rebooting with no internet
    ===================================================================== */
@@ -212,7 +317,7 @@ const toList = (obj) => (obj && typeof obj === 'object') ? Object.keys(obj).map(
 /* =====================================================================
    BOARD CALCULATION (pure function, recalculated every minute)
    ===================================================================== */
-function computeBoard({ hebcal, now, tz, settings, dynamicRules }) {
+function computeBoard({ hebcal, now, tz, settings, dynamicRules, weekdayRules, seasonal, il }) {
   const out = { ready: false };
   if (!hebcal) return out;
   out.ready = true;
@@ -266,7 +371,49 @@ function computeBoard({ hebcal, now, tz, settings, dynamicRules }) {
   if (hEvs.some(isCholHamoed)) inserts.push("יעלה ויבוא (חול המועד)");
   if (hEvs.some(e => chanukahCandles(e) >= 2 || isChanukahEighthDay(e))) inserts.push("על הניסים (חנוכה)");
   if (hEvs.some(e => /^Purim$/i.test(e.title || ''))) inserts.push("על הניסים (פורים)");
+
+  const seasonalCfg = seasonal || {};
+  if (seasonalCfg.mode === 'manual') {
+    if (seasonalCfg.mashivHaruach) inserts.push("משיב הרוח ומוריד הגשם");
+    if (seasonalCfg.vtenTal) inserts.push("ותן טל ומטר לברכה");
+  } else {
+    const hd = hdOfKey(hKey);
+    if (hd.getMonth() === months.TISHREI && hd.getDate() === 22) inserts.push("משיב הרוח ומוריד הגשם (מתחילים במוסף)");
+    else if (hd.getMonth() === months.NISAN && hd.getDate() === 15) inserts.push("מפסיקים משיב הרוח במוסף");
+    else if (mashivOn(hKey)) inserts.push("משיב הרוח ומוריד הגשם");
+    if (vtenOn(hKey, il)) {
+      inserts.push("ותן טל ומטר לברכה");
+    } else if (hKey === civilKey && vtenOn(tomorrowKey, il)) {
+      const chatzot = T(civilKey, 'chatzot');
+      if (chatzot && now >= chatzot) inserts.push("ותן טל ומטר - מתחילים הערב במעריב");
+    }
+  }
   out.inserts = inserts;
+
+  /* ---------- Weekday dynamic minyanim ---------- */
+  const dow = dowOfKey(civilKey);
+  const minuteOfDay = (d) => { const p = tzParts(d, tz); return p.hour * 60 + p.minute; };
+  out.weekdayDynamic = (weekdayRules || []).map(rule => {
+    const zname = WEEKDAY_ANCHORS[rule.anchor];
+    const offset = Number(rule.offset);
+    const days = ruleDays(rule);
+    if (!zname || !Number.isFinite(offset) || !days.includes(dow)) return null;
+    let base = null;
+    if (rule.weekly === 'earliest' || rule.weekly === 'latest') {
+      // Same time every day this week, based on the earliest/latest anchor among the rule's days
+      const weekStart = addDays(civilKey, -dow);
+      const mins = days.map(d => T(addDays(weekStart, d), zname)).filter(Boolean).map(minuteOfDay);
+      if (mins.length) {
+        const pick = rule.weekly === 'earliest' ? Math.min(...mins) : Math.max(...mins);
+        base = zonedToInstant(civilKey, Math.floor(pick / 60), pick % 60, tz);
+      }
+    } else {
+      base = T(civilKey, zname);
+    }
+    if (!base) return null;
+    const mode = rule.round || (offset <= 0 ? 'down' : 'up');
+    return { id: `w-${rule.id}`, label: rule.label, time: fmt(roundTime(new Date(base.getTime() + offset * 60000), mode)) };
+  }).filter(Boolean);
 
   // Chanukah: Hebcal dates "N Candles" on the civil date of the evening you light
   out.chanukahTonight = evs(civilKey).reduce((n, e) => Math.max(n, chanukahCandles(e)), 0);
@@ -442,9 +589,8 @@ function computeBoard({ hebcal, now, tz, settings, dynamicRules }) {
    ===================================================================== */
 const App = () => {
   const [realTime, setRealTime] = useState(new Date());
-  const [hebcal, setHebcal] = useState(null);
-  const [fetchError, setFetchError] = useState(null);
-  const [refreshTick, setRefreshTick] = useState(0);
+  const [locError, setLocError] = useState(null);
+  const [locRetry, setLocRetry] = useState(0);
 
   const settingsNode = useFbNode('settings', EMPTY_OBJ);
   const settings = settingsNode.value || EMPTY_OBJ;
@@ -452,6 +598,7 @@ const App = () => {
   const manualNode = useFbNode('manual_minyanim', null);
   const shabbosNode = useFbNode('shabbos_minyanim', null);
   const rulesNode = useFbNode('dynamic_rules', null);
+  const weekdayRulesNode = useFbNode('weekday_rules', null);
   const seasonalNode = useFbNode('seasonal_tefillah', EMPTY_OBJ);
   const overridesNode = useFbNode('overrides', EMPTY_OBJ);
 
@@ -466,10 +613,9 @@ const App = () => {
   }, []);
 
   /* ---------- Settings ---------- */
-  const zip = String(settings.zipCode || '10001').trim();
   const candleMins = Number(settings.candleMinutes) > 0 ? Number(settings.candleMinutes) : 18;
-  const cacheKey = `${CACHE_PREFIX}:${zip}:${candleMins}`;
-  const tz = (hebcal && hebcal.tzid) || BROWSER_TZ;
+  const il = settings.il === true;
+  const zip = String(settings.zipCode || '').trim();
   const theme = ALLOWED_THEMES.includes(settings.theme) ? settings.theme : 'dark';
   const fontFamily = ALLOWED_FONTS.includes(settings.font) ? settings.font : 'Heebo';
   const mainBg = safeUrl(settings.mainBg);
@@ -477,6 +623,49 @@ const App = () => {
   const logoUrl = safeUrl(settings.logoUrl);
   const shulName = settings.shulName || 'בית כנסת אוהל משה';
   const shulSubtitle = settings.shulSubtitle ?? 'קהילת קודש';
+
+  /* ---------- Location ----------
+     The admin saves coordinates in settings/location. Older setups that only
+     have a zip code get a one-time lookup from Hebcal, cached on the device. */
+  const settingsLoc = validLocation(settings.location) ? settings.location : null;
+  const [zipLoc, setZipLoc] = useState(() => {
+    try { const raw = zip && localStorage.getItem(LOC_CACHE_PREFIX + zip); return raw ? JSON.parse(raw) : null; }
+    catch (e) { return null; }
+  });
+
+  useEffect(() => {
+    if (settingsLoc || !zip) return;
+    let cancelled = false;
+    try {
+      const raw = localStorage.getItem(LOC_CACHE_PREFIX + zip);
+      if (raw) { setZipLoc(JSON.parse(raw)); setLocError(null); return; }
+    } catch (e) { /* ignore */ }
+    setZipLoc(null);
+    (async () => {
+      try {
+        const res = await fetch(`https://www.hebcal.com/zmanim?cfg=json&zip=${encodeURIComponent(zip)}`);
+        const data = await res.json();
+        if (!res.ok || !data.location) throw new Error(data.error || `Zip ${zip} not found`);
+        const found = { latitude: data.location.latitude, longitude: data.location.longitude, tzid: data.location.tzid, name: data.location.name };
+        if (cancelled) return;
+        try { localStorage.setItem(LOC_CACHE_PREFIX + zip, JSON.stringify(found)); } catch (e) { /* ignore */ }
+        setZipLoc(found);
+        setLocError(null);
+      } catch (err) {
+        if (!cancelled) setLocError(err.message || String(err));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [zip, !!settingsLoc, locRetry]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!locError) return;
+    const id = setInterval(() => setLocRetry(n => n + 1), 15 * 60000);
+    return () => clearInterval(id);
+  }, [locError]);
+
+  const loc = settingsLoc || (validLocation(zipLoc) ? zipLoc : null);
+  const tz = loc ? loc.tzid : BROWSER_TZ;
 
   /* ---------- Simulation (date + time, clock keeps running, auto-expires) ---------- */
   const sim = settings.simulation;
@@ -490,83 +679,36 @@ const App = () => {
   }
   const civilKey = dateKeyInTz(activeNow, tz);
 
-  /* ---------- Hebcal: load cache for this location, then fetch ---------- */
-  useEffect(() => {
+  /* ---------- Calendar: calculated on the device, recalculated daily ---------- */
+  const calc = useMemo(() => {
+    if (!loc) return { data: null, error: null };
     try {
-      const raw = localStorage.getItem(cacheKey);
-      setHebcal(raw ? JSON.parse(raw) : null);
-    } catch (e) { setHebcal(null); }
-  }, [cacheKey]);
-
-  useEffect(() => {
-    if (!settingsNode.loaded) return;   // don't fetch with the default zip before Firebase answers
-    let cancelled = false;
-    const start = addDays(civilKey, -3);
-    const end = addDays(civilKey, 35);
-    const z = encodeURIComponent(zip);
-    const eventsUrl = `https://www.hebcal.com/hebcal?v=1&cfg=json&zip=${z}&start=${start}&end=${end}&maj=on&min=on&mf=on&ss=on&nx=on&F=on&o=on&d=on&c=on&b=${candleMins}&M=on&s=on&leyning=on&a=on`;
-    const zmanimUrl = `https://www.hebcal.com/zmanim?cfg=json&zip=${z}&start=${start}&end=${end}`;
-
-    (async () => {
-      try {
-        const [eRes, zRes] = await Promise.all([fetch(eventsUrl), fetch(zmanimUrl)]);
-        if (!eRes.ok || !zRes.ok) throw new Error(`Hebcal HTTP ${eRes.status}/${zRes.status}`);
-        const [eData, zData] = await Promise.all([eRes.json(), zRes.json()]);
-        if (eData.error || zData.error) throw new Error(eData.error || zData.error);
-
-        const timesByDate = {};
-        Object.entries(zData.times || {}).forEach(([zman, byDate]) => {
-          if (byDate && typeof byDate === 'object') {
-            Object.entries(byDate).forEach(([d, iso]) => {
-              if (!timesByDate[d]) timesByDate[d] = {};
-              timesByDate[d][zman] = iso;
-            });
-          }
-        });
-
-        const payload = {
-          timestamp: Date.now(), zip, candleMins, start, end,
-          tzid: (zData.location && zData.location.tzid) || (eData.location && eData.location.tzid) || null,
-          locationName: (zData.location && zData.location.name) || '',
-          times: timesByDate,
-          events: eData.items || []
-        };
-        if (cancelled) return;
-        try { localStorage.setItem(cacheKey, JSON.stringify(payload)); } catch (e) { /* storage full */ }
-        setHebcal(payload);
-        setFetchError(null);
-      } catch (err) {
-        if (!cancelled) setFetchError(err.message || String(err)); // cached data (if any) stays on screen
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [cacheKey, civilKey, refreshTick, settingsNode.loaded]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Retry every 15 minutes while offline, and refresh data older than 6 hours
-  useEffect(() => {
-    const id = setInterval(() => {
-      const stale = !hebcal || Date.now() - (hebcal.timestamp || 0) > 6 * 3600000;
-      if (fetchError || stale) setRefreshTick(t => t + 1);
-    }, 15 * 60000);
-    return () => clearInterval(id);
-  }, [fetchError, hebcal]);
+      return { data: buildCalendar({ loc, il, candleMins, startKey: addDays(civilKey, -7), endKey: addDays(civilKey, 35) }), error: null };
+    } catch (err) {
+      console.error('Calendar calculation failed', err);
+      return { data: null, error: err.message || String(err) };
+    }
+  }, [loc && loc.latitude, loc && loc.longitude, loc && loc.tzid, loc && loc.name, il, candleMins, civilKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  const hebcal = calc.data;
 
   /* ---------- Derived board data ---------- */
   const dynamicRules = useMemo(() => toList(rulesNode.value), [rulesNode.value]);
+  const weekdayRules = useMemo(() => toList(weekdayRulesNode.value), [weekdayRulesNode.value]);
+  const seasonal = seasonalNode.value || EMPTY_OBJ;
   const board = useMemo(
-    () => computeBoard({ hebcal, now: activeNow, tz, settings, dynamicRules }),
-    [hebcal, activeNow.getTime(), tz, settings, dynamicRules] // eslint-disable-line react-hooks/exhaustive-deps
+    () => computeBoard({ hebcal, now: activeNow, tz, settings, dynamicRules, weekdayRules, seasonal, il }),
+    [hebcal, activeNow.getTime(), tz, settings, dynamicRules, weekdayRules, seasonal, il] // eslint-disable-line react-hooks/exhaustive-deps
   );
 
   /* ---------- Heartbeat to Admin ---------- */
-  let tvStatus = 'OK', tvMessage = 'Rendering normally';
-  if (!hebcal) { tvStatus = 'ERROR'; tvMessage = fetchError ? `No zmanim data: ${fetchError}` : 'Loading zmanim...'; }
-  else if (!board.hasToday) { tvStatus = 'ERROR'; tvMessage = `No zmanim cached for ${civilKey}${fetchError ? ` (${fetchError})` : ''}`; }
-  else if (fetchError) { tvStatus = 'WARNING'; tvMessage = `Offline - showing cached data from ${new Date(hebcal.timestamp).toLocaleString()} (${fetchError})`; }
+  let tvStatus = 'OK', tvMessage = `Rendering for ${loc ? loc.name || `${loc.latitude}, ${loc.longitude}` : ''} (${il ? 'Israel' : 'Diaspora'})`;
+  if (!loc) { tvStatus = 'ERROR'; tvMessage = locError ? `No location: ${locError}` : 'No location set - choose the shul location in the admin panel.'; }
+  else if (calc.error) { tvStatus = 'ERROR'; tvMessage = `Calendar calculation failed: ${calc.error}`; }
+  else if (!board.hasToday) { tvStatus = 'ERROR'; tvMessage = `No zmanim for ${civilKey}`; }
   else if (simActive) { tvStatus = 'SIMULATION'; tvMessage = `Simulating ${sim.date} ${sim.time || ''}`; }
 
   const beatRef = useRef({});
-  beatRef.current = { status: tvStatus, message: tvMessage, activeDate: civilKey, location: (hebcal && hebcal.locationName) || zip };
+  beatRef.current = { status: tvStatus, message: tvMessage, activeDate: civilKey, location: loc ? `${loc.name || ''} (${il ? 'Israel' : 'Diaspora'})` : '' };
   const sendBeat = useCallback(() => {
     set(ref(db, 'system_logs/tv_status'), {
       ...beatRef.current,
@@ -613,7 +755,7 @@ const App = () => {
   }, [tickerMessages, fontFamily]);
 
   /* ---------- Minyan lists ---------- */
-  const displayWeekdayMinyanim = toList(manualNode.value)
+  const displayWeekdayMinyanim = [...toList(manualNode.value), ...(board.weekdayDynamic || [])]
     .sort((a, b) => parseTimeStrToMinutes(a.time) - parseTimeStrToMinutes(b.time));
 
   const dayRank = (d) => (d === 'erev' ? 0 : 1);
@@ -634,10 +776,7 @@ const App = () => {
   const displayHaftarah = overrides.haftarah || (period ? period.haftarah : '');
   const candleRows = period ? period.candles.map((c, i) => (i === 0 && overrides.candles ? { ...c, time: overrides.candles } : c)) : [];
 
-  const seasonal = seasonalNode.value || EMPTY_OBJ;
-  const finalInsertions = [...(board.inserts || [])];
-  if (seasonal.mashivHaruach) finalInsertions.push("משיב הרוח ומוריד הגשם");
-  if (seasonal.vtenTal) finalInsertions.push("ותן טל ומטר לברכה");
+  const finalInsertions = board.inserts || [];
 
   const motzeiLabel = period && period.lastIsShabbos ? 'מוצאי שבת' : 'מוצאי יו״ט';
 
@@ -799,7 +938,7 @@ const App = () => {
               </div>
             ) : (
               <div style={{ textAlign: 'center', marginTop: '5vh', color: 'var(--text-sec)' }}>
-                {fetchError ? 'אין חיבור לשרת הזמנים - מנסה שוב...' : 'טוען זמנים...'}
+                {!loc ? 'לא הוגדר מיקום לבית הכנסת' : 'טוען זמנים...'}
               </div>
             )}
           </div>

@@ -96,6 +96,45 @@ const ROUND_OPTIONS = [
 ];
 const defaultRound = (base) => (base === 'shabbos_tzeis' ? 'none' : 'down');
 
+const WEEKDAY_ANCHOR_OPTIONS = [
+  { value: 'alos', label: 'Alos HaShachar' },
+  { value: 'netz', label: 'Netz (sunrise)' },
+  { value: 'chatzos', label: 'Chatzos' },
+  { value: 'mincha_gedola', label: 'Mincha Gedola' },
+  { value: 'mincha_ketana', label: 'Mincha Ketana' },
+  { value: 'plag', label: 'Plag HaMincha' },
+  { value: 'shkia', label: 'Shkia (sunset)' },
+  { value: 'tzeis', label: 'Tzeis (7.083°)' },
+  { value: 'tzeis85', label: 'Tzeis (8.5°)' }
+];
+const WEEKLY_OPTIONS = [
+  { value: 'daily', label: 'Changes daily' },
+  { value: 'earliest', label: 'Same all week (earliest)' },
+  { value: 'latest', label: 'Same all week (latest)' }
+];
+const WEEKDAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri'];
+const ruleDayList = (raw) => {
+  const list = Array.isArray(raw) ? raw : (raw && typeof raw === 'object' ? Object.values(raw) : [0, 1, 2, 3, 4]);
+  return list.map(Number).filter(n => n >= 0 && n <= 5).sort();
+};
+const weekdayDefaultRound = (offset) => (Number(offset) <= 0 ? 'down' : 'up');
+
+const TIMEZONES = (() => {
+  try { return Intl.supportedValuesOf('timeZone'); } catch (e) { return ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles', 'Asia/Jerusalem', 'Europe/London']; }
+})();
+
+const DayPicker = ({ days, onChange }) => (
+  <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
+    {WEEKDAY_NAMES.map((name, d) => {
+      const on = days.includes(d);
+      return (
+        <button key={d} type="button" onClick={() => onChange(on ? days.filter(x => x !== d) : [...days, d].sort())}
+          className={`day-chip ${on ? 'on' : ''}`} aria-pressed={on}>{name}</button>
+      );
+    })}
+  </div>
+);
+
 /* =====================================================================
    ROW EDITORS
    ===================================================================== */
@@ -205,6 +244,68 @@ const DynamicMinyanRow = ({ minyan }) => {
   );
 };
 
+const WeekdayRuleRow = ({ rule }) => {
+  const [lbl, setLbl] = useState(rule.label || '');
+  const [offset, setOffset] = useState(String(rule.offset ?? ''));
+  const [st, show] = useStatus();
+  const anchor = rule.anchor || 'shkia';
+  const weekly = rule.weekly || 'daily';
+  const days = ruleDayList(rule.days);
+  const round = rule.round || weekdayDefaultRound(rule.offset);
+
+  useEffect(() => {
+    setLbl(rule.label || '');
+    setOffset(String(rule.offset ?? ''));
+  }, [rule.label, rule.offset]);
+
+  const current = () => ({
+    label: rule.label || '', anchor, weekly, days, round,
+    offset: Number.isFinite(Number(rule.offset)) ? Number(rule.offset) : 0
+  });
+  const write = (data) => set(ref(db, `weekday_rules/${rule.id}`), data)
+    .then(() => show('ok', '✓ Saved'))
+    .catch(() => show('err', 'Save failed - check your connection or permissions.'));
+
+  const handleSave = () => {
+    if (lbl === (rule.label || '') && offset === String(rule.offset ?? '')) return;
+    if (!lbl.trim()) { show('err', "Name can't be empty."); setLbl(rule.label || ''); return; }
+    if (offset.trim() === '' || !Number.isFinite(Number(offset))) { show('err', 'Enter minutes, e.g. -15 or 10.'); setOffset(String(rule.offset ?? '')); return; }
+    write({ ...current(), label: lbl.trim(), offset: Number(offset) });
+  };
+
+  const handleChange = (changes) => {
+    if (changes.days && changes.days.length === 0) { show('err', 'Pick at least one day.'); return; }
+    write({ ...current(), ...changes });
+  };
+
+  const handleDelete = () => {
+    if (window.confirm(`Delete the rule "${rule.label}"?`)) remove(ref(db, `weekday_rules/${rule.id}`));
+  };
+  const onKey = (e) => { if (e.key === 'Enter') e.target.blur(); };
+
+  return (
+    <li className="data-item" style={{ gap: '10px', flexWrap: 'wrap' }}>
+      <input value={lbl} onChange={e => setLbl(e.target.value)} onBlur={handleSave} onKeyDown={onKey} className="form-control" style={{ flex: 2, minWidth: '120px', background: 'transparent' }} dir="auto" />
+      <div style={{ flex: 5, display: 'flex', gap: '5px', alignItems: 'center', flexWrap: 'wrap' }}>
+        <input type="number" value={offset} onChange={e => setOffset(e.target.value)} onBlur={handleSave} onKeyDown={onKey} className="form-control" style={{ width: '70px', background: 'transparent', padding: '6px' }} />
+        <span style={{ fontSize: '13px', color: '#64748b' }}>mins from</span>
+        <select value={anchor} onChange={e => handleChange({ anchor: e.target.value })} className="form-control" style={{ flex: 1, minWidth: '130px', background: 'transparent', padding: '6px' }}>
+          {WEEKDAY_ANCHOR_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+        </select>
+        <select value={weekly} onChange={e => handleChange({ weekly: e.target.value })} className="form-control" style={{ flex: 1, minWidth: '160px', background: 'transparent', padding: '6px' }}>
+          {WEEKLY_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+        </select>
+        <select value={round} onChange={e => handleChange({ round: e.target.value })} className="form-control" style={{ flex: 1, minWidth: '140px', background: 'transparent', padding: '6px' }}>
+          {ROUND_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+        </select>
+        <DayPicker days={days} onChange={(d) => handleChange({ days: d })} />
+      </div>
+      <StatusText st={st} />
+      <button onClick={handleDelete} className="btn btn-danger" style={{ padding: '8px 12px' }}>Delete</button>
+    </li>
+  );
+};
+
 /* =====================================================================
    ADMIN
    ===================================================================== */
@@ -239,7 +340,16 @@ const Admin = () => {
   const [dynRound, setDynRound] = useState("down");
   const [dynSt, showDyn] = useStatus();
 
-  const [seasonal, setSeasonal] = useState({ mashivHaruach: false, vtenTal: false });
+  const [seasonal, setSeasonal] = useState({ mode: 'auto', mashivHaruach: false, vtenTal: false });
+
+  const [weekdayRules, setWeekdayRules] = useState([]);
+  const [wkLabel, setWkLabel] = useState("");
+  const [wkAnchor, setWkAnchor] = useState("shkia");
+  const [wkOffset, setWkOffset] = useState("");
+  const [wkWeekly, setWkWeekly] = useState("daily");
+  const [wkRound, setWkRound] = useState("");
+  const [wkDays, setWkDays] = useState([0, 1, 2, 3, 4]);
+  const [wkSt, showWk] = useStatus();
   const [overrides, setOverrides] = useState({ parsha: "", haftarah: "", daf: "", omer: "", candles: "", expires: "" });
   const [overrideSt, showOverride] = useStatus();
   const [tvStatus, setTvStatus] = useState(null);
@@ -247,6 +357,13 @@ const Admin = () => {
   // Settings form fields
   const [zipInput, setZipInput] = useState("");
   const [zipSt, showZip] = useStatus();
+  const [locMode, setLocMode] = useState("zip");
+  const [latInput, setLatInput] = useState("");
+  const [lonInput, setLonInput] = useState("");
+  const [tzInput, setTzInput] = useState("Asia/Jerusalem");
+  const [locName, setLocName] = useState("");
+  const [coordSt, showCoord] = useStatus();
+  const [ilSt, showIl] = useStatus();
   const [candleMinutes, setCandleMinutes] = useState("18");
   const [klStartDays, setKlStartDays] = useState("3");
   const [klEndOpinion, setKlEndOpinion] = useState("15days");
@@ -293,7 +410,8 @@ const Admin = () => {
       setShabbosMinyanim(parsed);
     });
     listen('dynamic_rules', (data) => setDynamicRules(data ? Object.keys(data).map(key => ({ id: key, ...data[key] })) : []));
-    listen('seasonal_tefillah', (data) => { if (data) setSeasonal(data); });
+    listen('seasonal_tefillah', (data) => setSeasonal({ mode: 'auto', mashivHaruach: false, vtenTal: false, ...(data || {}) }));
+    listen('weekday_rules', (data) => setWeekdayRules(data ? Object.keys(data).map(key => ({ id: key, ...data[key] })) : []));
     listen('overrides', (data) => setOverrides({ parsha: "", haftarah: "", daf: "", omer: "", candles: "", expires: "", ...(data || {}) }));
     listen('system_logs/tv_status', (data) => setTvStatus(data || null));
 
@@ -302,6 +420,15 @@ const Admin = () => {
 
   // Seed each form field only when its own setting changes, so typing in one card isn't overwritten
   useEffect(() => { setZipInput(settings.zipCode || ""); }, [settings.zipCode]);
+  useEffect(() => {
+    const l = settings.location;
+    if (!l) return;
+    setLatInput(String(l.latitude ?? ''));
+    setLonInput(String(l.longitude ?? ''));
+    setTzInput(l.tzid || 'Asia/Jerusalem');
+    setLocName(l.name || '');
+    setLocMode(settings.zipCode ? 'zip' : 'coords');
+  }, [settings.location, settings.zipCode]);
   useEffect(() => { setCandleMinutes(String(settings.candleMinutes ?? 18)); }, [settings.candleMinutes]);
   useEffect(() => { setKlStartDays(String(settings.klStartDays ?? 3)); }, [settings.klStartDays]);
   useEffect(() => { setKlEndOpinion(settings.klEndOpinion || "15days"); }, [settings.klEndOpinion]);
@@ -366,8 +493,21 @@ const Admin = () => {
     setDynLabel(""); setDynOffset("");
   };
 
-  const toggleMashiv = () => set(ref(db, 'seasonal_tefillah'), { ...seasonal, mashivHaruach: !seasonal.mashivHaruach });
-  const toggleVten = () => set(ref(db, 'seasonal_tefillah'), { ...seasonal, vtenTal: !seasonal.vtenTal });
+  const handleAddWeekdayRule = (e) => {
+    e.preventDefault();
+    if (!wkLabel.trim()) return showWk('err', 'Enter a name.');
+    if (wkOffset.trim() === '' || !Number.isFinite(Number(wkOffset))) return showWk('err', 'Enter minutes, e.g. -15 or 10.');
+    if (wkDays.length === 0) return showWk('err', 'Pick at least one day.');
+    push(ref(db, 'weekday_rules'), {
+      label: wkLabel.trim(), anchor: wkAnchor, offset: Number(wkOffset), weekly: wkWeekly,
+      round: wkRound || weekdayDefaultRound(wkOffset), days: wkDays
+    }).then(() => showWk('ok', `✓ Added ${wkLabel.trim()}`));
+    setWkLabel(""); setWkOffset(""); setWkRound("");
+  };
+
+  const setSeasonalMode = (mode) => set(ref(db, 'seasonal_tefillah'), { ...seasonal, mode });
+  const toggleMashiv = () => set(ref(db, 'seasonal_tefillah'), { ...seasonal, mode: 'manual', mashivHaruach: !seasonal.mashivHaruach });
+  const toggleVten = () => set(ref(db, 'seasonal_tefillah'), { ...seasonal, mode: 'manual', vtenTal: !seasonal.vtenTal });
 
   /* ---------- Settings handlers ---------- */
   const handleSaveZip = async (e) => {
@@ -385,8 +525,32 @@ const Admin = () => {
     } catch (err) {
       if (!window.confirm(`Couldn't reach Hebcal to verify zip ${z}. Save it anyway?`)) return showZip(null);
     }
-    await set(ref(db, 'settings/zipCode'), z);
-    showZip('ok', data ? `✓ Location set to ${data.location.name}. The TV updates within a minute.` : `✓ Zip ${z} saved (not verified).`, 6000);
+    const changes = { zipCode: z };
+    if (data) {
+      changes.location = { latitude: data.location.latitude, longitude: data.location.longitude, tzid: data.location.tzid, name: data.location.name };
+      changes.il = data.location.tzid === 'Asia/Jerusalem';
+    }
+    await update(ref(db, 'settings'), changes);
+    showZip('ok', data ? `✓ Location set to ${data.location.name}. The TV updates within a minute.` : `✓ Zip ${z} saved (not verified). The TV will look it up when it's online.`, 6000);
+  };
+
+  const handleSaveCoords = (e) => {
+    e.preventDefault();
+    const lat = Number(latInput), lon = Number(lonInput);
+    if (!Number.isFinite(lat) || lat < -90 || lat > 90 || latInput.trim() === '') return showCoord('err', 'Latitude must be a number between -90 and 90 (e.g. 31.778).');
+    if (!Number.isFinite(lon) || lon < -180 || lon > 180 || lonInput.trim() === '') return showCoord('err', 'Longitude must be a number between -180 and 180 (e.g. 35.235).');
+    if (!TIMEZONES.includes(tzInput)) return showCoord('err', 'Choose a time zone from the list.');
+    update(ref(db, 'settings'), {
+      location: { latitude: lat, longitude: lon, tzid: tzInput, name: locName.trim() || `${lat}, ${lon}` },
+      zipCode: null,
+      il: tzInput === 'Asia/Jerusalem'
+    }).then(() => showCoord('ok', `✓ Location saved${tzInput === 'Asia/Jerusalem' ? ' and set to Israel' : ''}. The TV updates within a minute.`, 6000))
+      .catch(() => showCoord('err', 'Save failed.'));
+  };
+
+  const handleSetIl = (value) => {
+    set(ref(db, 'settings/il'), value)
+      .then(() => showIl('ok', value ? '✓ Israel: one-day Yom Tov, Israeli parsha schedule, V\'sen Tal from 7 Cheshvan.' : '✓ Diaspora: two-day Yom Tov, Diaspora parsha schedule, V\'sen Tal from Dec 4/5.', 6000));
   };
 
   const handleSaveHalacha = (e) => {
@@ -522,6 +686,9 @@ const Admin = () => {
         .row-status.err { color: #dc2626; white-space: normal; }
         .row-status.info { color: #2563eb; }
         .card-status { margin-top: 10px; display: block; }
+        .day-chip { padding: 6px 10px; border-radius: 6px; border: 1px solid #d1d5db; background: #fff; color: #4b5563; font-size: 13px; font-weight: 600; cursor: pointer; }
+        .day-chip.on { background: #2563eb; border-color: #2563eb; color: #fff; }
+        .day-chip:focus-visible, .toggle-btn:focus-visible, .btn:focus-visible { outline: 2px solid #1d4ed8; outline-offset: 2px; }
         .health-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; color: #4b5563; gap: 10px; }
       `}</style>
 
@@ -614,19 +781,70 @@ const Admin = () => {
           {/* ===== LOCATION & HALACHIC SETTINGS ===== */}
           <div className="card">
             <h3>🌍 Location & Halachic Settings</h3>
-            <form onSubmit={handleSaveZip} className="form-row" style={{ marginBottom: '10px' }}>
-              <div className="form-group" style={{ flex: 2 }}>
-                <label>Shul Zip Code</label>
-                <input type="text" inputMode="numeric" value={zipInput} onChange={(e) => setZipInput(e.target.value)} placeholder="e.g. 10001" className="form-control" required />
+            <div className="help-box">
+              The board calculates every zman on the TV itself from these coordinates, so it keeps working with no internet.
+              {settings.location && (
+                <><br /><strong>Current location:</strong> {settings.location.name} ({Number(settings.location.latitude).toFixed(4)}, {Number(settings.location.longitude).toFixed(4)}, {settings.location.tzid})</>
+              )}
+            </div>
+            <div className="toggle-group" style={{ marginBottom: '15px' }}>
+              <button type="button" onClick={() => setLocMode('zip')} className={`toggle-btn ${locMode === 'zip' ? 'active' : ''}`}>US zip code</button>
+              <button type="button" onClick={() => setLocMode('coords')} className={`toggle-btn ${locMode === 'coords' ? 'active' : ''}`}>Coordinates (Israel & elsewhere)</button>
+            </div>
+
+            {locMode === 'zip' ? (
+              <form onSubmit={handleSaveZip} className="form-row" style={{ marginBottom: '10px' }}>
+                <div className="form-group" style={{ flex: 2 }}>
+                  <label>Shul Zip Code</label>
+                  <input type="text" inputMode="numeric" value={zipInput} onChange={(e) => setZipInput(e.target.value)} placeholder="e.g. 10001" className="form-control" required />
+                </div>
+                <button type="submit" className="btn btn-primary">Update Location</button>
+              </form>
+            ) : (
+              <form onSubmit={handleSaveCoords} style={{ marginBottom: '10px' }}>
+                <div className="form-row">
+                  <div className="form-group">
+                    <label>Latitude</label>
+                    <input type="text" inputMode="decimal" value={latInput} onChange={(e) => setLatInput(e.target.value)} placeholder="31.778" className="form-control" />
+                  </div>
+                  <div className="form-group">
+                    <label>Longitude</label>
+                    <input type="text" inputMode="decimal" value={lonInput} onChange={(e) => setLonInput(e.target.value)} placeholder="35.235" className="form-control" />
+                  </div>
+                  <div className="form-group">
+                    <label>Time zone</label>
+                    <select value={tzInput} onChange={(e) => setTzInput(e.target.value)} className="form-control">
+                      {TIMEZONES.map(z => <option key={z} value={z}>{z}</option>)}
+                    </select>
+                  </div>
+                </div>
+                <div className="form-row">
+                  <div className="form-group" style={{ flex: 2 }}>
+                    <label>Place name (for your reference)</label>
+                    <input type="text" value={locName} onChange={(e) => setLocName(e.target.value)} placeholder="e.g. Jerusalem" dir="auto" className="form-control" />
+                  </div>
+                  <button type="submit" className="btn btn-primary">Save Location</button>
+                </div>
+                <div style={{ fontSize: '13px', color: '#64748b' }}>
+                  To find coordinates, right-click the shul on Google Maps; the first item in the menu is the latitude, longitude.
+                </div>
+              </form>
+            )}
+            <StatusText st={locMode === 'zip' ? zipSt : coordSt} />
+
+            <div style={{ marginTop: '20px', borderTop: '1px solid #f3f4f6', paddingTop: '20px' }}>
+              <label style={{ fontSize: '13px', fontWeight: 600, color: '#4b5563', display: 'block', marginBottom: '8px' }}>Calendar:</label>
+              <div className="toggle-group">
+                <button type="button" onClick={() => handleSetIl(false)} className={`toggle-btn ${settings.il !== true ? 'active' : ''}`}>Diaspora (חוץ לארץ)</button>
+                <button type="button" onClick={() => handleSetIl(true)} className={`toggle-btn ${settings.il === true ? 'active' : ''}`}>Israel (ארץ ישראל)</button>
               </div>
-              <button type="submit" className="btn btn-primary">Update Location</button>
-            </form>
-            <StatusText st={zipSt} />
+              <StatusText st={ilSt} />
+            </div>
 
             <form onSubmit={handleSaveHalacha} style={{ marginTop: '20px', borderTop: '1px solid #f3f4f6', paddingTop: '20px' }}>
               <div className="form-row">
                 <div className="form-group">
-                  <label>Candle lighting (minutes before Shkia)</label>
+                  <label>Candle lighting (minutes before Shkia; Jerusalem uses 40)</label>
                   <input type="number" min="10" max="60" value={candleMinutes} onChange={(e) => setCandleMinutes(e.target.value)} className="form-control" />
                 </div>
                 <div className="form-group">
@@ -709,14 +927,26 @@ const Admin = () => {
             </form>
 
             <label style={{ fontSize: '13px', fontWeight: 600, color: '#4b5563', display: 'block', marginBottom: '8px' }}>Seasonal Tefillah Inserts:</label>
-            <div className="toggle-group">
-              <button onClick={toggleMashiv} className={`toggle-btn ${seasonal.mashivHaruach ? 'toggle-on' : 'toggle-off'}`}>
-                {seasonal.mashivHaruach ? "✓ משיב הרוח" : "מוריד הטל"}
-              </button>
-              <button onClick={toggleVten} className={`toggle-btn ${seasonal.vtenTal ? 'toggle-on' : 'toggle-off'}`}>
-                {seasonal.vtenTal ? "✓ ותן טל ומטר" : "ברכנו"}
-              </button>
+            <div className="toggle-group" style={{ marginBottom: '12px' }}>
+              <button onClick={() => setSeasonalMode('auto')} className={`toggle-btn ${seasonal.mode !== 'manual' ? 'active' : ''}`}>Automatic</button>
+              <button onClick={() => setSeasonalMode('manual')} className={`toggle-btn ${seasonal.mode === 'manual' ? 'active' : ''}`}>Manual</button>
             </div>
+            {seasonal.mode !== 'manual' ? (
+              <div style={{ fontSize: '14px', color: '#4b5563', lineHeight: 1.5 }}>
+                משיב הרוח starts at Musaf of Shemini Atzeres and stops at Musaf of the first day of Pesach.
+                ותן טל ומטר starts at Maariv of {settings.il === true ? '7 Cheshvan (Israel)' : 'December 4, or December 5 before a civil leap year (Diaspora)'} and
+                ends after Mincha of Erev Pesach. The board shows a reminder on the day each one changes.
+              </div>
+            ) : (
+              <div className="toggle-group">
+                <button onClick={toggleMashiv} className={`toggle-btn ${seasonal.mashivHaruach ? 'toggle-on' : 'toggle-off'}`}>
+                  {seasonal.mashivHaruach ? "✓ משיב הרוח" : "מוריד הטל"}
+                </button>
+                <button onClick={toggleVten} className={`toggle-btn ${seasonal.vtenTal ? 'toggle-on' : 'toggle-off'}`}>
+                  {seasonal.vtenTal ? "✓ ותן טל ומטר" : "ברכנו"}
+                </button>
+              </div>
+            )}
           </div>
 
           {/* ===== WEEKDAY SCHEDULE ===== */}
@@ -751,6 +981,57 @@ const Admin = () => {
               {manualMinyanim.map((m) => (
                 <ManualMinyanRow key={m.id} minyan={m} dbPath="manual_minyanim" />
               ))}
+            </ul>
+          </div>
+
+          {/* ===== WEEKDAY DYNAMIC ===== */}
+          <div className="card">
+            <h3>🌅 Weekday Schedule (Dynamic)</h3>
+            <div className="help-box">
+              Minyanim that follow the sun, like "Mincha 15 minutes before Shkia". Use a negative number for before, positive for after.
+              "Same all week" gives one steady time based on the earliest (or latest) Shkia of the week, so people don't have to check every day.
+              These appear alongside your fixed weekday times on the selected days.
+            </div>
+            <form onSubmit={handleAddWeekdayRule}>
+              <div className="form-row">
+                <div className="form-group" style={{ flex: 2 }}>
+                  <label>Minyan Name</label>
+                  <input type="text" value={wkLabel} onChange={(e) => setWkLabel(e.target.value)} placeholder="e.g. מנחה" dir="auto" className="form-control" required />
+                </div>
+                <div className="form-group" style={{ flex: 1 }}>
+                  <label>Minutes</label>
+                  <input type="number" value={wkOffset} onChange={(e) => setWkOffset(e.target.value)} placeholder="-15" className="form-control" required />
+                </div>
+                <div className="form-group" style={{ flex: 2 }}>
+                  <label>From</label>
+                  <select value={wkAnchor} onChange={(e) => setWkAnchor(e.target.value)} className="form-control">
+                    {WEEKDAY_ANCHOR_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
+                </div>
+              </div>
+              <div className="form-row">
+                <div className="form-group">
+                  <label>Time changes</label>
+                  <select value={wkWeekly} onChange={(e) => setWkWeekly(e.target.value)} className="form-control">
+                    {WEEKLY_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
+                </div>
+                <div className="form-group">
+                  <label>Rounding</label>
+                  <select value={wkRound || weekdayDefaultRound(wkOffset)} onChange={(e) => setWkRound(e.target.value)} className="form-control">
+                    {ROUND_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
+                </div>
+                <div className="form-group" style={{ flex: 2 }}>
+                  <label>Days</label>
+                  <DayPicker days={wkDays} onChange={setWkDays} />
+                </div>
+                <button type="submit" className="btn btn-primary">Add</button>
+              </div>
+            </form>
+            <StatusText st={wkSt} />
+            <ul className="data-list" style={{ marginTop: '10px' }}>
+              {weekdayRules.map((r) => <WeekdayRuleRow key={r.id} rule={r} />)}
             </ul>
           </div>
 
