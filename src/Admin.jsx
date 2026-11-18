@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { ref, onValue, push, remove, set, update } from 'firebase/database';
+import { ref, onValue, push, remove, set, update, get, query, limitToLast, limitToFirst, orderByChild, endAt, serverTimestamp } from 'firebase/database';
 import { signInWithEmailAndPassword, signOut, onAuthStateChanged } from 'firebase/auth';
 import { db, auth } from './firebase';
 
@@ -68,6 +68,86 @@ const useNow = (ms) => {
   const [now, setNow] = useState(Date.now());
   useEffect(() => { const id = setInterval(() => setNow(Date.now()), ms); return () => clearInterval(id); }, [ms]);
   return now;
+};
+
+/* =====================================================================
+   CHANGE HISTORY
+   Every admin change goes through commit(): it reads the old values,
+   writes the new ones and a history entry in one atomic update, so any
+   change can be undone later.
+   ===================================================================== */
+const HISTORY_DAYS = 120;
+
+// Compares values regardless of key order
+const stable = (v) => {
+  if (v === undefined || v === null) return 'null';
+  if (Array.isArray(v)) return `[${v.map(stable).join(',')}]`;
+  if (typeof v === 'object') return `{${Object.keys(v).sort().filter(k => v[k] !== null && v[k] !== undefined).map(k => `${JSON.stringify(k)}:${stable(v[k])}`).join(',')}}`;
+  return JSON.stringify(v);
+};
+
+const commit = async (changes, summary, meta = {}) => {
+  const user = auth.currentUser;
+  const paths = Object.keys(changes);
+  const befores = await Promise.all(paths.map(p => get(ref(db, p)).then(snap => snap.val())));
+  const entries = paths
+    .map((p, i) => ({ path: p, before: befores[i] ?? null, after: changes[p] ?? null }))
+    .filter(e => stable(e.before) !== stable(e.after));
+  if (entries.length === 0) return false; // nothing actually changed
+
+  const logKey = push(ref(db, 'audit_log')).key;
+  const email = (user && user.email) || 'unknown';
+  const updates = {};
+  entries.forEach(e => { updates[e.path] = e.after; });
+  updates[`audit_log/${logKey}`] = {
+    ts: serverTimestamp(),
+    uid: user ? user.uid : 'unknown',
+    email,
+    summary,
+    changes: entries,
+    ...(meta.undoOf ? { undoOf: meta.undoOf, baseSummary: meta.baseSummary || summary } : {})
+  };
+  if (meta.undoOf) {
+    updates[`audit_log/${meta.undoOf}/undone`] = { byEmail: email, logId: logKey, ts: serverTimestamp() };
+    if (meta.reviveId) updates[`audit_log/${meta.reviveId}/undone`] = null; // undoing an undo brings the original back
+  }
+  await update(ref(db), updates);
+  return true;
+};
+
+const SECTION_NAMES = {
+  manual_minyanim: 'weekday minyan',
+  shabbos_minyanim: 'Shabbos minyan',
+  dynamic_rules: 'Shabbos rule',
+  weekday_rules: 'weekday rule'
+};
+const BASE_NAMES = { friday_candle: 'Fri candles', friday_shkia: 'Fri Shkia', shabbos_shkia: 'Shabbos Shkia', shabbos_tzeis: 'Shabbos Tzeis' };
+const ANCHOR_NAMES = {
+  alos: 'Alos', netz: 'Netz', chatzos: 'Chatzos', mincha_gedola: 'Mincha Gedola', mincha_ketana: 'Mincha Ketana',
+  plag: 'Plag', shkia: 'Shkia', tzeis: 'Tzeis', tzeis85: 'Tzeis (8.5°)'
+};
+const shortText = (t) => { const s = String(t || ''); return s.length > 40 ? `${s.slice(0, 40)}…` : s; };
+const describeOffset = (offset, anchorName) => {
+  const n = Number(offset) || 0;
+  if (n === 0) return `at ${anchorName}`;
+  return `${Math.abs(n)} min ${n < 0 ? 'before' : 'after'} ${anchorName}`;
+};
+const describeMinyan = (m, withDay) => `"${m.label} ${m.time}"${withDay ? ` (${m.day === 'erev' ? 'Fri night' : 'Sat'})` : ''}`;
+const describeShabbosRule = (r) => `"${r.label}" ${describeOffset(r.offset, BASE_NAMES[r.base] || r.base)}`;
+const describeWeekdayRule = (r) => {
+  const days = (Array.isArray(r.days) ? r.days : []).map(d => ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri'][d]).filter(Boolean).join('/');
+  const weekly = r.weekly === 'earliest' ? ', same all week (earliest)' : r.weekly === 'latest' ? ', same all week (latest)' : '';
+  return `"${r.label}" ${describeOffset(r.offset, ANCHOR_NAMES[r.anchor] || r.anchor)} (${days}${weekly})`;
+};
+const describeForSection = (section, item, withDay) => {
+  if (section === 'dynamic_rules') return describeShabbosRule(item);
+  if (section === 'weekday_rules') return describeWeekdayRule(item);
+  return describeMinyan(item, withDay);
+};
+
+const formatWhen = (ts) => {
+  if (typeof ts !== 'number') return 'just now';
+  return new Date(ts).toLocaleString([], { weekday: 'short', month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 };
 
 // Small inline status message ("✓ Saved", errors)
@@ -149,7 +229,11 @@ const ManualMinyanRow = ({ minyan, dbPath, withDay }) => {
     setTm(minyan.time || '');
   }, [minyan.label, minyan.time]);
 
-  const write = (data) => set(ref(db, `${dbPath}/${minyan.id}`), data)
+  const section = SECTION_NAMES[dbPath] || dbPath;
+  const write = (data) => commit(
+    { [`${dbPath}/${minyan.id}`]: data },
+    `Changed ${section} ${describeMinyan(minyan, withDay)} → ${describeMinyan(data, withDay)}`
+  )
     .then(() => show('ok', '✓ Saved'))
     .catch(() => show('err', 'Save failed - check your connection or permissions.'));
 
@@ -165,7 +249,10 @@ const ManualMinyanRow = ({ minyan, dbPath, withDay }) => {
   const handleDayChange = (day) => write({ label: minyan.label || '', time: minyan.time || '', day });
 
   const handleDelete = () => {
-    if (window.confirm(`Delete "${minyan.label} ${minyan.time}"?`)) remove(ref(db, `${dbPath}/${minyan.id}`));
+    if (window.confirm(`Delete "${minyan.label} ${minyan.time}"?`)) {
+      commit({ [`${dbPath}/${minyan.id}`]: null }, `Deleted ${section} ${describeMinyan(minyan, withDay)}`)
+        .catch(() => show('err', 'Delete failed.'));
+    }
   };
 
   const onKey = (e) => { if (e.key === 'Enter') e.target.blur(); };
@@ -197,7 +284,10 @@ const DynamicMinyanRow = ({ minyan }) => {
     setOffset(String(minyan.offset ?? ''));
   }, [minyan.label, minyan.offset]);
 
-  const write = (data) => set(ref(db, `dynamic_rules/${minyan.id}`), data)
+  const write = (data) => commit(
+    { [`dynamic_rules/${minyan.id}`]: data },
+    `Changed Shabbos rule ${describeShabbosRule(minyan)} → ${describeShabbosRule(data)}`
+  )
     .then(() => show('ok', '✓ Saved'))
     .catch(() => show('err', 'Save failed - check your connection or permissions.'));
 
@@ -217,7 +307,10 @@ const DynamicMinyanRow = ({ minyan }) => {
   });
 
   const handleDelete = () => {
-    if (window.confirm(`Delete the rule "${minyan.label}"?`)) remove(ref(db, `dynamic_rules/${minyan.id}`));
+    if (window.confirm(`Delete the rule "${minyan.label}"?`)) {
+      commit({ [`dynamic_rules/${minyan.id}`]: null }, `Deleted Shabbos rule ${describeShabbosRule(minyan)}`)
+        .catch(() => show('err', 'Delete failed.'));
+    }
   };
 
   const onKey = (e) => { if (e.key === 'Enter') e.target.blur(); };
@@ -262,7 +355,10 @@ const WeekdayRuleRow = ({ rule }) => {
     label: rule.label || '', anchor, weekly, days, round,
     offset: Number.isFinite(Number(rule.offset)) ? Number(rule.offset) : 0
   });
-  const write = (data) => set(ref(db, `weekday_rules/${rule.id}`), data)
+  const write = (data) => commit(
+    { [`weekday_rules/${rule.id}`]: data },
+    `Changed weekday rule ${describeWeekdayRule({ ...rule, days })} → ${describeWeekdayRule(data)}`
+  )
     .then(() => show('ok', '✓ Saved'))
     .catch(() => show('err', 'Save failed - check your connection or permissions.'));
 
@@ -279,7 +375,10 @@ const WeekdayRuleRow = ({ rule }) => {
   };
 
   const handleDelete = () => {
-    if (window.confirm(`Delete the rule "${rule.label}"?`)) remove(ref(db, `weekday_rules/${rule.id}`));
+    if (window.confirm(`Delete the rule "${rule.label}"?`)) {
+      commit({ [`weekday_rules/${rule.id}`]: null }, `Deleted weekday rule ${describeWeekdayRule({ ...rule, days })}`)
+        .catch(() => show('err', 'Delete failed.'));
+    }
   };
   const onKey = (e) => { if (e.key === 'Enter') e.target.blur(); };
 
@@ -353,6 +452,10 @@ const Admin = () => {
   const [overrides, setOverrides] = useState({ parsha: "", haftarah: "", daf: "", omer: "", candles: "", expires: "" });
   const [overrideSt, showOverride] = useStatus();
   const [tvStatus, setTvStatus] = useState(null);
+  const [history, setHistory] = useState([]);
+  const [historyLimit, setHistoryLimit] = useState(25);
+  const [historySt, showHistory] = useStatus();
+  const [undoingId, setUndoingId] = useState(null);
 
   // Settings form fields
   const [zipInput, setZipInput] = useState("");
@@ -418,6 +521,53 @@ const Admin = () => {
     return () => subs.forEach(u => u());
   }, [user]);
 
+  useEffect(() => {
+    if (!user || isAdmin !== true) return undefined;
+    // +1 so we know whether there are older entries to show
+    return onValue(query(ref(db, 'audit_log'), limitToLast(historyLimit + 1)), (snap) => {
+      const list = [];
+      snap.forEach(child => { list.push({ id: child.key, ...child.val() }); });
+      setHistory(list.reverse());
+    }, () => setHistory([]));
+  }, [user, isAdmin, historyLimit]);
+
+  // Remove history older than HISTORY_DAYS (runs once per admin visit)
+  useEffect(() => {
+    if (!user || isAdmin !== true) return;
+    const cutoff = Date.now() - HISTORY_DAYS * 86400000;
+    get(query(ref(db, 'audit_log'), orderByChild('ts'), endAt(cutoff), limitToFirst(200)))
+      .then((snap) => {
+        const removals = {};
+        snap.forEach(child => { removals[`audit_log/${child.key}`] = null; });
+        if (Object.keys(removals).length) return update(ref(db), removals);
+        return null;
+      })
+      .catch(() => { /* not critical */ });
+  }, [user, isAdmin]);
+
+  const handleUndo = async (entry) => {
+    const changes = Array.isArray(entry.changes) ? entry.changes : Object.values(entry.changes || {});
+    if (changes.length === 0) return;
+    const isRedo = !!entry.undoOf;
+    const base = entry.baseSummary || entry.summary;
+    setUndoingId(entry.id);
+    try {
+      const current = await Promise.all(changes.map(c => get(ref(db, c.path)).then(snap => snap.val())));
+      const changedSince = changes.some((c, i) => stable(current[i]) !== stable(c.after ?? null));
+      let msg = isRedo ? `Re-apply this change?\n\n${base}` : `Undo this change?\n\n${entry.summary}`;
+      if (changedSince) msg += `\n\nHeads up: this was changed again afterwards. ${isRedo ? 'Re-applying' : 'Undoing'} will replace the newer value too.`;
+      if (!window.confirm(msg)) return;
+      const restore = {};
+      changes.forEach(c => { restore[c.path] = c.before ?? null; });
+      const did = await commit(restore, `${isRedo ? 'Redid' : 'Undid'}: ${base}`, { undoOf: entry.id, baseSummary: base, reviveId: entry.undoOf || null });
+      showHistory('ok', did ? (isRedo ? '✓ Change re-applied.' : '✓ Change undone.') : 'Nothing to change - it already matches.', 4000);
+    } catch (err) {
+      showHistory('err', 'Undo failed - check your connection or permissions.');
+    } finally {
+      setUndoingId(null);
+    }
+  };
+
   // Seed each form field only when its own setting changes, so typing in one card isn't overwritten
   useEffect(() => { setZipInput(settings.zipCode || ""); }, [settings.zipCode]);
   useEffect(() => {
@@ -455,13 +605,15 @@ const Admin = () => {
   const handleAddMessage = (e) => {
     e.preventDefault();
     if (!newMessage.trim()) return;
-    push(ref(db, 'ticker'), newMessage.trim());
+    const text = newMessage.trim();
+    const key = push(ref(db, 'ticker')).key;
+    commit({ [`ticker/${key}`]: text }, `Added announcement "${shortText(text)}"`);
     setNewMessage("");
   };
 
   const handleDeleteMessage = (msg) => {
     if (!window.confirm(`Delete this announcement?\n\n${msg.text}`)) return;
-    remove(msg.id === 'legacy' ? ref(db, 'ticker') : ref(db, `ticker/${msg.id}`));
+    commit({ [msg.id === 'legacy' ? 'ticker' : `ticker/${msg.id}`]: null }, `Deleted announcement "${shortText(msg.text)}"`);
   };
 
   const handleAddManual = (e) => {
@@ -469,8 +621,10 @@ const Admin = () => {
     if (!minyanLabel.trim()) return showManual('err', 'Enter a name.');
     const time = resolveTime(minyanTime, (msg) => showManual('err', msg));
     if (time === null) return;
-    push(ref(db, 'manual_minyanim'), { label: minyanLabel.trim(), time })
-      .then(() => showManual('ok', `✓ Added ${minyanLabel.trim()} ${time}`));
+    const item = { label: minyanLabel.trim(), time };
+    commit({ [`manual_minyanim/${push(ref(db, 'manual_minyanim')).key}`]: item }, `Added weekday minyan ${describeMinyan(item)}`)
+      .then(() => showManual('ok', `✓ Added ${item.label} ${time}`))
+      .catch(() => showManual('err', 'Save failed.'));
     setMinyanLabel(""); setMinyanTime("");
   };
 
@@ -479,8 +633,10 @@ const Admin = () => {
     if (!shabbosLabel.trim()) return showShabbos('err', 'Enter a name.');
     const time = resolveTime(shabbosTime, (msg) => showShabbos('err', msg));
     if (time === null) return;
-    push(ref(db, 'shabbos_minyanim'), { label: shabbosLabel.trim(), time, day: shabbosDay })
-      .then(() => showShabbos('ok', `✓ Added ${shabbosLabel.trim()} ${time}`));
+    const item = { label: shabbosLabel.trim(), time, day: shabbosDay };
+    commit({ [`shabbos_minyanim/${push(ref(db, 'shabbos_minyanim')).key}`]: item }, `Added Shabbos minyan ${describeMinyan(item, true)}`)
+      .then(() => showShabbos('ok', `✓ Added ${item.label} ${time}`))
+      .catch(() => showShabbos('err', 'Save failed.'));
     setShabbosLabel(""); setShabbosTime("");
   };
 
@@ -488,8 +644,10 @@ const Admin = () => {
     e.preventDefault();
     if (!dynLabel.trim()) return showDyn('err', 'Enter a name.');
     if (dynOffset.trim() === '' || !Number.isFinite(Number(dynOffset))) return showDyn('err', 'Enter minutes, e.g. -20 or 15.');
-    push(ref(db, 'dynamic_rules'), { label: dynLabel.trim(), base: dynBase, offset: Number(dynOffset), round: dynRound })
-      .then(() => showDyn('ok', `✓ Added ${dynLabel.trim()}`));
+    const item = { label: dynLabel.trim(), base: dynBase, offset: Number(dynOffset), round: dynRound };
+    commit({ [`dynamic_rules/${push(ref(db, 'dynamic_rules')).key}`]: item }, `Added Shabbos rule ${describeShabbosRule(item)}`)
+      .then(() => showDyn('ok', `✓ Added ${item.label}`))
+      .catch(() => showDyn('err', 'Save failed.'));
     setDynLabel(""); setDynOffset("");
   };
 
@@ -498,16 +656,26 @@ const Admin = () => {
     if (!wkLabel.trim()) return showWk('err', 'Enter a name.');
     if (wkOffset.trim() === '' || !Number.isFinite(Number(wkOffset))) return showWk('err', 'Enter minutes, e.g. -15 or 10.');
     if (wkDays.length === 0) return showWk('err', 'Pick at least one day.');
-    push(ref(db, 'weekday_rules'), {
+    const item = {
       label: wkLabel.trim(), anchor: wkAnchor, offset: Number(wkOffset), weekly: wkWeekly,
       round: wkRound || weekdayDefaultRound(wkOffset), days: wkDays
-    }).then(() => showWk('ok', `✓ Added ${wkLabel.trim()}`));
+    };
+    commit({ [`weekday_rules/${push(ref(db, 'weekday_rules')).key}`]: item }, `Added weekday rule ${describeWeekdayRule(item)}`)
+      .then(() => showWk('ok', `✓ Added ${item.label}`))
+      .catch(() => showWk('err', 'Save failed.'));
     setWkLabel(""); setWkOffset(""); setWkRound("");
   };
 
-  const setSeasonalMode = (mode) => set(ref(db, 'seasonal_tefillah'), { ...seasonal, mode });
-  const toggleMashiv = () => set(ref(db, 'seasonal_tefillah'), { ...seasonal, mode: 'manual', mashivHaruach: !seasonal.mashivHaruach });
-  const toggleVten = () => set(ref(db, 'seasonal_tefillah'), { ...seasonal, mode: 'manual', vtenTal: !seasonal.vtenTal });
+  const setSeasonalMode = (mode) => commit({ seasonal_tefillah: { ...seasonal, mode } }, `Set seasonal inserts to ${mode === 'manual' ? 'Manual' : 'Automatic'}`);
+  const toggleMashiv = () => commit(
+    { seasonal_tefillah: { ...seasonal, mode: 'manual', mashivHaruach: !seasonal.mashivHaruach } },
+    `Set seasonal insert to ${!seasonal.mashivHaruach ? 'משיב הרוח' : 'מוריד הטל'} (manual)`
+  );
+  const toggleVten = () => commit(
+    { seasonal_tefillah: { ...seasonal, mode: 'manual', vtenTal: !seasonal.vtenTal } },
+    `Set seasonal insert to ${!seasonal.vtenTal ? 'ותן טל ומטר' : 'ברכנו'} (manual)`
+  );
+  const setSetting = (key, value, summary) => commit({ [`settings/${key}`]: value }, summary);
 
   /* ---------- Settings handlers ---------- */
   const handleSaveZip = async (e) => {
@@ -525,12 +693,16 @@ const Admin = () => {
     } catch (err) {
       if (!window.confirm(`Couldn't reach Hebcal to verify zip ${z}. Save it anyway?`)) return showZip(null);
     }
-    const changes = { zipCode: z };
+    const changes = { 'settings/zipCode': z };
     if (data) {
-      changes.location = { latitude: data.location.latitude, longitude: data.location.longitude, tzid: data.location.tzid, name: data.location.name };
-      changes.il = data.location.tzid === 'Asia/Jerusalem';
+      changes['settings/location'] = { latitude: data.location.latitude, longitude: data.location.longitude, tzid: data.location.tzid, name: data.location.name };
+      changes['settings/il'] = data.location.tzid === 'Asia/Jerusalem';
     }
-    await update(ref(db, 'settings'), changes);
+    try {
+      await commit(changes, `Changed location to ${data ? data.location.name : `zip ${z}`}`);
+    } catch (err) {
+      return showZip('err', 'Save failed - check your connection or permissions.');
+    }
     showZip('ok', data ? `✓ Location set to ${data.location.name}. The screen updates within a minute.` : `✓ Zip ${z} saved (not verified). The screen will look it up when it's online.`, 6000);
   };
 
@@ -540,16 +712,17 @@ const Admin = () => {
     if (!Number.isFinite(lat) || lat < -90 || lat > 90 || latInput.trim() === '') return showCoord('err', 'Latitude must be a number between -90 and 90 (e.g. 31.778).');
     if (!Number.isFinite(lon) || lon < -180 || lon > 180 || lonInput.trim() === '') return showCoord('err', 'Longitude must be a number between -180 and 180 (e.g. 35.235).');
     if (!TIMEZONES.includes(tzInput)) return showCoord('err', 'Choose a time zone from the list.');
-    update(ref(db, 'settings'), {
-      location: { latitude: lat, longitude: lon, tzid: tzInput, name: locName.trim() || `${lat}, ${lon}` },
-      zipCode: null,
-      il: tzInput === 'Asia/Jerusalem'
-    }).then(() => showCoord('ok', `✓ Location saved${tzInput === 'Asia/Jerusalem' ? ' and set to Israel' : ''}. The Screen updates within a minute.`, 6000))
+    const placeName = locName.trim() || `${lat}, ${lon}`;
+    commit({
+      'settings/location': { latitude: lat, longitude: lon, tzid: tzInput, name: placeName },
+      'settings/zipCode': null,
+      'settings/il': tzInput === 'Asia/Jerusalem'
+    }, `Changed location to ${placeName}`).then(() => showCoord('ok', `✓ Location saved${tzInput === 'Asia/Jerusalem' ? ' and set to Israel' : ''}. The Screen updates within a minute.`, 6000))
       .catch(() => showCoord('err', 'Save failed.'));
   };
 
   const handleSetIl = (value) => {
-    set(ref(db, 'settings/il'), value)
+    setSetting('il', value, `Switched calendar to ${value ? 'Eretz Yisrael' : 'Chutz Laaretz'}`)
       .then(() => showIl('ok', value ? '✓ Israel: one-day Yom Tov, Israeli parsha schedule, V\'sen Tal from 7 Cheshvan.' : '✓ Chutz Laaretz: two-day Yom Tov, Chutz Laaretz parsha schedule, V\'sen Tal from Dec 4/5.', 6000));
   };
 
@@ -557,25 +730,34 @@ const Admin = () => {
     e.preventDefault();
     const mins = Number(candleMinutes);
     if (!Number.isInteger(mins) || mins < 10 || mins > 60) return showHalacha('err', 'Candle lighting must be a whole number between 10 and 60 minutes.');
-    update(ref(db, 'settings'), {
-      candleMinutes: mins,
-      klStartDays: Number(klStartDays) === 7 ? 7 : 3,
-      klEndOpinion,
-      omerRollover
-    }).then(() => showHalacha('ok', '✓ Saved', 4000)).catch(() => showHalacha('err', 'Save failed.'));
+    const klDays = Number(klStartDays) === 7 ? 7 : 3;
+    const diffs = [];
+    if (Number(settings.candleMinutes ?? 18) !== mins) diffs.push(`candle lighting ${settings.candleMinutes ?? 18} → ${mins} min`);
+    if (Number(settings.klStartDays ?? 3) !== klDays) diffs.push(`Kiddush Levana start ${settings.klStartDays ?? 3} → ${klDays} days`);
+    if ((settings.klEndOpinion || '15days') !== klEndOpinion) diffs.push(`Kiddush Levana end → ${klEndOpinion === 'between_moldos' ? 'Mechaber' : 'Rema'}`);
+    if ((settings.omerRollover || 'tzeis') !== omerRollover) diffs.push(`Omer changes at ${omerRollover === 'shkia' ? 'Shkia' : 'Tzeis'}`);
+    commit({
+      'settings/candleMinutes': mins,
+      'settings/klStartDays': klDays,
+      'settings/klEndOpinion': klEndOpinion,
+      'settings/omerRollover': omerRollover
+    }, diffs.length ? `Changed ${diffs.join(', ')}` : 'Saved halachic settings')
+      .then((did) => showHalacha('ok', did ? '✓ Saved' : 'No changes to save.', 4000))
+      .catch(() => showHalacha('err', 'Save failed.'));
   };
 
   const handleSaveVisuals = (e) => {
     e.preventDefault();
     const bad = [['Logo', logoUrl], ['Main background', mainBg], ['Panel background', panelBg]].filter(([, u]) => !isValidImageUrl(u));
     if (bad.length) return showVisual('err', `${bad.map(b => b[0]).join(', ')}: use a direct https:// link with no spaces or quotes.`);
-    update(ref(db, 'settings'), {
-      shulName: shulName.trim(),
-      shulSubtitle: shulSubtitle.trim(),
-      logoUrl: logoUrl.trim(),
-      mainBg: mainBg.trim(),
-      panelBg: panelBg.trim()
-    }).then(() => showVisual('ok', '✓ Saved', 4000)).catch(() => showVisual('err', 'Save failed.'));
+    const next = { shulName: shulName.trim(), shulSubtitle: shulSubtitle.trim(), logoUrl: logoUrl.trim(), mainBg: mainBg.trim(), panelBg: panelBg.trim() };
+    const names = { shulName: 'shul name', shulSubtitle: 'subtitle', logoUrl: 'logo', mainBg: 'main background', panelBg: 'panel background' };
+    const changed = Object.keys(next).filter(k => (settings[k] || '') !== next[k]).map(k => names[k]);
+    const changes = {};
+    Object.keys(next).forEach(k => { changes[`settings/${k}`] = next[k]; });
+    commit(changes, changed.length ? `Changed ${changed.join(', ')}` : 'Saved name & visuals')
+      .then((did) => showVisual('ok', did ? '✓ Saved' : 'No changes to save.', 4000))
+      .catch(() => showVisual('err', 'Save failed.'));
   };
 
   /* ---------- Overrides ---------- */
@@ -586,14 +768,15 @@ const Admin = () => {
     fields.forEach(f => { clean[f] = (overrides[f] || '').trim(); });
     const anySet = fields.some(f => clean[f]);
     clean.expires = anySet ? (overrides.expires || nextSundayKey()) : '';
-    set(ref(db, 'overrides'), clean)
-      .then(() => showOverride('ok', anySet ? `✓ Saved. Overrides stop showing after ${clean.expires}.` : '✓ Saved.', 6000))
+    const setNames = { parsha: 'parsha', haftarah: 'haftarah', daf: 'daf', omer: 'omer', candles: 'candle lighting' };
+    commit({ overrides: clean }, anySet ? `Set overrides (${fields.filter(f => clean[f]).map(f => setNames[f]).join(', ')}) through ${clean.expires}` : 'Cleared override values')
+      .then((did) => showOverride('ok', !did ? 'No changes to save.' : anySet ? `✓ Saved. Overrides stop showing after ${clean.expires}.` : '✓ Saved.', 6000))
       .catch(() => showOverride('err', 'Save failed.'));
   };
 
   const handleClearOverrides = () => {
     if (!window.confirm('Clear all overrides and go back to automatic values?')) return;
-    remove(ref(db, 'overrides')).then(() => showOverride('ok', '✓ All overrides cleared.', 4000));
+    commit({ overrides: null }, 'Cleared all overrides').then(() => showOverride('ok', '✓ All overrides cleared.', 4000));
   };
 
   /* ---------- Simulation ---------- */
@@ -689,6 +872,12 @@ const Admin = () => {
         .day-chip { padding: 6px 10px; border-radius: 6px; border: 1px solid #d1d5db; background: #fff; color: #4b5563; font-size: 13px; font-weight: 600; cursor: pointer; }
         .day-chip.on { background: #2563eb; border-color: #2563eb; color: #fff; }
         .day-chip:focus-visible, .toggle-btn:focus-visible, .btn:focus-visible { outline: 2px solid #1d4ed8; outline-offset: 2px; }
+        .history-item { display: flex; align-items: center; gap: 12px; padding: 10px 12px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; margin-bottom: 8px; }
+        .history-item.undone { opacity: 0.6; }
+        .history-item.undone .history-summary { text-decoration: line-through; }
+        .history-summary { font-size: 14px; color: #111827; overflow-wrap: anywhere; }
+        .history-meta { font-size: 12px; color: #64748b; margin-top: 3px; }
+        .history-btn { height: auto; padding: 6px 14px; font-size: 13px; flex-shrink: 0; }
         .health-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; color: #4b5563; gap: 10px; }
       `}</style>
 
@@ -738,6 +927,44 @@ const Admin = () => {
               </div>
             ) : (
               <p style={{ color: '#64748b' }}>Waiting for the screen to check in. If this doesn't change within 5 minutes, open the board on the screen.</p>
+            )}
+          </div>
+
+          {/* ===== CHANGE HISTORY ===== */}
+          <div className="card">
+            <h3>🕘 Recent Changes</h3>
+            <div className="help-box">
+              Every change made in this panel is listed here, newest first. <strong>Undo</strong> puts back what was there before;
+              an undo can itself be reversed with <strong>Redo</strong>. History is kept for {HISTORY_DAYS} days. Simulation tests aren't listed.
+            </div>
+            <StatusText st={historySt} />
+            {history.length === 0 ? (
+              <p style={{ color: '#64748b', margin: 0 }}>No changes recorded yet.</p>
+            ) : (
+              <ul className="data-list">
+                {history.slice(0, historyLimit).map((h) => {
+                  const undone = !!h.undone;
+                  return (
+                    <li key={h.id} className={`history-item ${undone ? 'undone' : ''}`}>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div className="history-summary" dir="auto">{h.summary}</div>
+                        <div className="history-meta">
+                          {formatWhen(h.ts)} · {h.email}
+                          {undone && <> · <strong>{h.undoOf ? 'Redone' : 'Undone'} by {h.undone.byEmail}</strong></>}
+                        </div>
+                      </div>
+                      {!undone && (
+                        <button onClick={() => handleUndo(h)} disabled={undoingId === h.id} className="btn btn-secondary history-btn">
+                          {undoingId === h.id ? '…' : h.undoOf ? 'Redo' : 'Undo'}
+                        </button>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+            {history.length > historyLimit && (
+              <button onClick={() => setHistoryLimit(n => n + 25)} className="btn btn-secondary" style={{ marginTop: '10px' }}>Show older changes</button>
             )}
           </div>
 
@@ -881,17 +1108,17 @@ const Admin = () => {
             <h3>🎨 Display</h3>
             <label style={{ fontSize: '13px', fontWeight: 600, color: '#4b5563', display: 'block', marginBottom: '8px' }}>Select Decor Theme:</label>
             <div className="toggle-group" style={{ marginBottom: '20px' }}>
-              <button onClick={() => set(ref(db, 'settings/theme'), 'dark')} className={`toggle-btn ${settings.theme === 'dark' || !settings.theme ? 'active' : ''}`}>🌙 Modern Dark</button>
-              <button onClick={() => set(ref(db, 'settings/theme'), 'light')} className={`toggle-btn ${settings.theme === 'light' ? 'active' : ''}`}>☀️ Modern Light</button>
-              <button onClick={() => set(ref(db, 'settings/theme'), 'marble')} className={`toggle-btn ${settings.theme === 'marble' ? 'active' : ''}`}>🏛️ Gold & Marble</button>
-              <button onClick={() => set(ref(db, 'settings/theme'), 'wood')} className={`toggle-btn ${settings.theme === 'wood' ? 'active' : ''}`}>🌲 Natural Wood</button>
+              <button onClick={() => setSetting('theme', 'dark', 'Changed theme to Modern Dark')} className={`toggle-btn ${settings.theme === 'dark' || !settings.theme ? 'active' : ''}`}>🌙 Modern Dark</button>
+              <button onClick={() => setSetting('theme', 'light', 'Changed theme to Modern Light')} className={`toggle-btn ${settings.theme === 'light' ? 'active' : ''}`}>☀️ Modern Light</button>
+              <button onClick={() => setSetting('theme', 'marble', 'Changed theme to Gold & Marble')} className={`toggle-btn ${settings.theme === 'marble' ? 'active' : ''}`}>🏛️ Gold & Marble</button>
+              <button onClick={() => setSetting('theme', 'wood', 'Changed theme to Natural Wood')} className={`toggle-btn ${settings.theme === 'wood' ? 'active' : ''}`}>🌲 Natural Wood</button>
             </div>
 
             <label style={{ fontSize: '13px', fontWeight: 600, color: '#4b5563', display: 'block', marginBottom: '8px' }}>Select Font Style:</label>
             <div className="toggle-group" style={{ marginBottom: '25px', borderBottom: '1px solid #f3f4f6', paddingBottom: '20px' }}>
-              <button onClick={() => set(ref(db, 'settings/font'), 'Heebo')} className={`toggle-btn ${settings.font === 'Heebo' || !settings.font ? 'active' : ''}`}>Heebo (Clean & Modern)</button>
-              <button onClick={() => set(ref(db, 'settings/font'), 'Rubik')} className={`toggle-btn ${settings.font === 'Rubik' ? 'active' : ''}`}>Rubik (Soft & Rounded)</button>
-              <button onClick={() => set(ref(db, 'settings/font'), 'Frank Ruhl Libre')} className={`toggle-btn ${settings.font === 'Frank Ruhl Libre' ? 'active' : ''}`}>Frank Ruhl (Classic Serif)</button>
+              <button onClick={() => setSetting('font', 'Heebo', 'Changed font to Heebo')} className={`toggle-btn ${settings.font === 'Heebo' || !settings.font ? 'active' : ''}`}>Heebo (Clean & Modern)</button>
+              <button onClick={() => setSetting('font', 'Rubik', 'Changed font to Rubik')} className={`toggle-btn ${settings.font === 'Rubik' ? 'active' : ''}`}>Rubik (Soft & Rounded)</button>
+              <button onClick={() => setSetting('font', 'Frank Ruhl Libre', 'Changed font to Frank Ruhl Libre')} className={`toggle-btn ${settings.font === 'Frank Ruhl Libre' ? 'active' : ''}`}>Frank Ruhl (Classic Serif)</button>
             </div>
 
             <div className="help-box">
@@ -935,7 +1162,7 @@ const Admin = () => {
               <div style={{ fontSize: '14px', color: '#4b5563', lineHeight: 1.5 }}>
                 משיב הרוח starts at Musaf of Shemini Atzeres and stops at Musaf of the first day of Pesach.
                 ותן טל ומטר starts at Maariv of {settings.il === true ? '7 Cheshvan (Israel)' : 'December 4, or December 5 before a civil leap year (Chutz Laaretz)'} and
-                ends after Mincha of Erev Pesach. The board shows a reminder on the day each one changes.
+                ends after Mincha of Erev Pesach. The board always shows which version to say (משיב הרוח or מוריד הטל, ותן טל ומטר or ברכנו) and highlights the day each one changes.
               </div>
             ) : (
               <div className="toggle-group">
