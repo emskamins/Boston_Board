@@ -531,7 +531,7 @@ const Admin = () => {
       changes.il = data.location.tzid === 'Asia/Jerusalem';
     }
     await update(ref(db, 'settings'), changes);
-    showZip('ok', data ? `✓ Location set to ${data.location.name}. The TV updates within a minute.` : `✓ Zip ${z} saved (not verified). The TV will look it up when it's online.`, 6000);
+    showZip('ok', data ? `✓ Location set to ${data.location.name}. The screen updates within a minute.` : `✓ Zip ${z} saved (not verified). The screen will look it up when it's online.`, 6000);
   };
 
   const handleSaveCoords = (e) => {
@@ -544,13 +544,13 @@ const Admin = () => {
       location: { latitude: lat, longitude: lon, tzid: tzInput, name: locName.trim() || `${lat}, ${lon}` },
       zipCode: null,
       il: tzInput === 'Asia/Jerusalem'
-    }).then(() => showCoord('ok', `✓ Location saved${tzInput === 'Asia/Jerusalem' ? ' and set to Israel' : ''}. The TV updates within a minute.`, 6000))
+    }).then(() => showCoord('ok', `✓ Location saved${tzInput === 'Asia/Jerusalem' ? ' and set to Israel' : ''}. The Screen updates within a minute.`, 6000))
       .catch(() => showCoord('err', 'Save failed.'));
   };
 
   const handleSetIl = (value) => {
     set(ref(db, 'settings/il'), value)
-      .then(() => showIl('ok', value ? '✓ Israel: one-day Yom Tov, Israeli parsha schedule, V\'sen Tal from 7 Cheshvan.' : '✓ Diaspora: two-day Yom Tov, Diaspora parsha schedule, V\'sen Tal from Dec 4/5.', 6000));
+      .then(() => showIl('ok', value ? '✓ Israel: one-day Yom Tov, Israeli parsha schedule, V\'sen Tal from 7 Cheshvan.' : '✓ Chutz Laaretz: two-day Yom Tov, Chutz Laaretz parsha schedule, V\'sen Tal from Dec 4/5.', 6000));
   };
 
   const handleSaveHalacha = (e) => {
@@ -606,7 +606,7 @@ const Admin = () => {
     if (!simDate) return showSim('err', 'Pick a date to simulate.');
     const t = Date.now();
     set(ref(db, 'settings/simulation'), { date: simDate, time: simTime || '12:00', setAt: t, expiresAt: t + 12 * 3600000 })
-      .then(() => { remove(ref(db, 'settings/simulationDate')); showSim('ok', '✓ The TV is now simulating that moment.', 4000); });
+      .then(() => { remove(ref(db, 'settings/simulationDate')); showSim('ok', '✓ The screen is now simulating that moment.', 4000); });
   };
 
   const handleClearSimulation = () => {
@@ -615,7 +615,7 @@ const Admin = () => {
     setSimDate(""); setSimTime("");
   };
 
-  /* ---------- TV health ---------- */
+  /* ---------- Screen health ---------- */
   const lastBeat = tvStatus && typeof tvStatus.lastUpdate === 'number' ? tvStatus.lastUpdate : null;
   const beatAgeMin = lastBeat ? Math.max(0, Math.round((now - lastBeat) / 60000)) : null;
   const tvStale = beatAgeMin !== null && beatAgeMin > 15;
@@ -707,9 +707,9 @@ const Admin = () => {
             </div>
           )}
 
-          {/* ===== TV HEALTH ===== */}
+          {/* ===== SCREEN HEALTH ===== */}
           <div className="card" style={{ background: '#f8fafc', borderColor: '#cbd5e1' }}>
-            <h3 style={{ color: '#0f172a' }}>📡 TV System Health</h3>
+            <h3 style={{ color: '#0f172a' }}>📡 Screen System Health</h3>
             {tvStatus ? (
               <div style={{ padding: '15px', background: toneColors.bg, border: `1px solid ${toneColors.border}`, borderRadius: '8px' }}>
                 <div className="health-row" style={{ fontSize: '15px' }}>
@@ -724,12 +724,12 @@ const Admin = () => {
                 {tvStatus.location && <div className="health-row"><strong>Location:</strong> <span>{tvStatus.location}</span></div>}
                 {tvStale && (
                   <div className="health-row" style={{ color: '#dc2626' }}>
-                    The TV hasn't checked in for over 15 minutes. Check that it's powered on and connected to the internet.
+                    The screen hasn't checked in for over 15 minutes. Check that it's powered on and connected to the internet.
                   </div>
                 )}
                 {Math.abs(clockDriftMin) >= 2 && !tvStale && (
                   <div className="health-row" style={{ color: '#b45309' }}>
-                    The TV's clock is off by about {Math.abs(clockDriftMin)} minutes. Fix the date and time settings on the TV device.
+                    The screen's clock is off by about {Math.abs(clockDriftMin)} minutes. Fix the date and time settings on the device.
                   </div>
                 )}
                 <div style={{ fontSize: '14px', color: '#4b5563', marginTop: '10px', padding: '10px', background: '#fff', borderRadius: '4px', border: '1px solid #e2e8f0' }}>
@@ -737,7 +737,7 @@ const Admin = () => {
                 </div>
               </div>
             ) : (
-              <p style={{ color: '#64748b' }}>Waiting for the TV to check in. If this doesn't change within 5 minutes, open the board on the TV.</p>
+              <p style={{ color: '#64748b' }}>Waiting for the screen to check in. If this doesn't change within 5 minutes, open the board on the screen.</p>
             )}
           </div>
 
@@ -747,7 +747,7 @@ const Admin = () => {
               {simActive ? "⚠️ Simulation Mode Active" : "🧪 Testing & Simulation"}
             </h3>
             <div className="help-box">
-              Jump the TV to any date and time to test zmanim, Shkia rollovers, fast days and Shabbos layouts.
+              Jump the display to any date and time to test zmanim, Shkia rollovers, fast days and Shabbos layouts.
               The simulated clock keeps running from the time you choose, so you can watch Shkia or Tzeis pass.
               Simulation turns itself off after 12 hours.
             </div>
@@ -758,7 +758,7 @@ const Admin = () => {
             )}
             {simExpired && (
               <p style={{ color: '#b45309', fontWeight: 600, marginTop: 0 }}>
-                The last simulation expired and the TV is back on the real date. Clear it to tidy up.
+                The last simulation expired and the screen is back on the real date. Clear it to tidy up.
               </p>
             )}
             <form onSubmit={handleSimulate} className="form-row">
@@ -782,14 +782,14 @@ const Admin = () => {
           <div className="card">
             <h3>🌍 Location & Halachic Settings</h3>
             <div className="help-box">
-              The board calculates every zman on the TV itself from these coordinates, so it keeps working with no internet.
+              The board calculates every zman on the screen itself from these coordinates, so it keeps working with no internet.
               {settings.location && (
                 <><br /><strong>Current location:</strong> {settings.location.name} ({Number(settings.location.latitude).toFixed(4)}, {Number(settings.location.longitude).toFixed(4)}, {settings.location.tzid})</>
               )}
             </div>
             <div className="toggle-group" style={{ marginBottom: '15px' }}>
               <button type="button" onClick={() => setLocMode('zip')} className={`toggle-btn ${locMode === 'zip' ? 'active' : ''}`}>US zip code</button>
-              <button type="button" onClick={() => setLocMode('coords')} className={`toggle-btn ${locMode === 'coords' ? 'active' : ''}`}>Coordinates (Israel & elsewhere)</button>
+              <button type="button" onClick={() => setLocMode('coords')} className={`toggle-btn ${locMode === 'coords' ? 'active' : ''}`}>Coordinates (Eretz Yisrael & elsewhere)</button>
             </div>
 
             {locMode === 'zip' ? (
@@ -835,8 +835,8 @@ const Admin = () => {
             <div style={{ marginTop: '20px', borderTop: '1px solid #f3f4f6', paddingTop: '20px' }}>
               <label style={{ fontSize: '13px', fontWeight: 600, color: '#4b5563', display: 'block', marginBottom: '8px' }}>Calendar:</label>
               <div className="toggle-group">
-                <button type="button" onClick={() => handleSetIl(false)} className={`toggle-btn ${settings.il !== true ? 'active' : ''}`}>Diaspora (חוץ לארץ)</button>
-                <button type="button" onClick={() => handleSetIl(true)} className={`toggle-btn ${settings.il === true ? 'active' : ''}`}>Israel (ארץ ישראל)</button>
+                <button type="button" onClick={() => handleSetIl(false)} className={`toggle-btn ${settings.il !== true ? 'active' : ''}`}>Chutz Laaretz (חוץ לארץ)</button>
+                <button type="button" onClick={() => handleSetIl(true)} className={`toggle-btn ${settings.il === true ? 'active' : ''}`}>Eretz Yisrael (ארץ ישראל)</button>
               </div>
               <StatusText st={ilSt} />
             </div>
@@ -934,7 +934,7 @@ const Admin = () => {
             {seasonal.mode !== 'manual' ? (
               <div style={{ fontSize: '14px', color: '#4b5563', lineHeight: 1.5 }}>
                 משיב הרוח starts at Musaf of Shemini Atzeres and stops at Musaf of the first day of Pesach.
-                ותן טל ומטר starts at Maariv of {settings.il === true ? '7 Cheshvan (Israel)' : 'December 4, or December 5 before a civil leap year (Diaspora)'} and
+                ותן טל ומטר starts at Maariv of {settings.il === true ? '7 Cheshvan (Israel)' : 'December 4, or December 5 before a civil leap year (Chutz Laaretz)'} and
                 ends after Mincha of Erev Pesach. The board shows a reminder on the day each one changes.
               </div>
             ) : (

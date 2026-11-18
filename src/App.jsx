@@ -65,7 +65,8 @@ const formatDayTime = (dateObj, tz) => {
   if (!dateObj || isNaN(dateObj.getTime())) return "";
   const key = dateKeyInTz(dateObj, tz);
   const [, m, d] = key.split('-').map(Number);
-  return `יום ${DAY_NAMES[dowOfKey(key)]} ${d}/${m} ${formatTime12(dateObj, tz)}`;
+  // e.g. "3:06PM 11/24" (time first, then month/day)
+  return `${formatTime12(dateObj, tz).replace(/\s+/g, '')} ${m}/${d}`;
 };
 
 const parseTimeStrToMinutes = (timeStr) => {
@@ -372,23 +373,40 @@ function computeBoard({ hebcal, now, tz, settings, dynamicRules, weekdayRules, s
   if (hEvs.some(e => chanukahCandles(e) >= 2 || isChanukahEighthDay(e))) inserts.push("על הניסים (חנוכה)");
   if (hEvs.some(e => /^Purim$/i.test(e.title || ''))) inserts.push("על הניסים (פורים)");
 
+  out.inserts = inserts;
+
+  /* ---------- Seasonal tefillah: always shows which version to say ---------- */
+  const MASHIV = "משיב הרוח ומוריד הגשם", MORID = "מוריד הטל";
+  const VTEN = "ותן טל ומטר לברכה", BORCHEINU = "ברכנו";
   const seasonalCfg = seasonal || {};
   if (seasonalCfg.mode === 'manual') {
-    if (seasonalCfg.mashivHaruach) inserts.push("משיב הרוח ומוריד הגשם");
-    if (seasonalCfg.vtenTal) inserts.push("ותן טל ומטר לברכה");
+    out.seasonal = [
+      { text: seasonalCfg.mashivHaruach ? MASHIV : MORID },
+      { text: seasonalCfg.vtenTal ? VTEN : BORCHEINU }
+    ];
   } else {
-    const hd = hdOfKey(hKey);
-    if (hd.getMonth() === months.TISHREI && hd.getDate() === 22) inserts.push("משיב הרוח ומוריד הגשם (מתחילים במוסף)");
-    else if (hd.getMonth() === months.NISAN && hd.getDate() === 15) inserts.push("מפסיקים משיב הרוח במוסף");
-    else if (mashivOn(hKey)) inserts.push("משיב הרוח ומוריד הגשם");
-    if (vtenOn(hKey, il)) {
-      inserts.push("ותן טל ומטר לברכה");
-    } else if (hKey === civilKey && vtenOn(tomorrowKey, il)) {
-      const chatzot = T(civilKey, 'chatzot');
-      if (chatzot && now >= chatzot) inserts.push("ותן טל ומטר - מתחילים הערב במעריב");
+    const hd = hdOfKey(hKey), hm = hd.getMonth(), hdDay = hd.getDate();
+    let mashivRow;
+    if (hm === months.TISHREI && hdDay === 22) mashivRow = { text: MASHIV, note: 'מתחילים במוסף', highlight: true };
+    else if (hm === months.NISAN && hdDay === 15) mashivRow = { text: MORID, note: 'מתחילים במוסף', highlight: true };
+    else mashivRow = { text: mashivOn(hKey) ? MASHIV : MORID };
+
+    const prevKey = addDays(hKey, -1);
+    const vtenToday = vtenOn(hKey, il);
+    let vtenRow;
+    if (vtenToday && !vtenOn(prevKey, il)) {
+      vtenRow = { text: VTEN, note: 'מתחילים במעריב', highlight: true };
+    } else if (vtenToday) {
+      vtenRow = { text: VTEN };
+    } else if (vtenOn(prevKey, il)) {
+      vtenRow = { text: BORCHEINU, note: 'מפסיקים ותן טל ומטר', highlight: true };
+    } else if (hKey === civilKey && vtenOn(tomorrowKey, il) && T(civilKey, 'chatzot') && now >= T(civilKey, 'chatzot')) {
+      vtenRow = { text: BORCHEINU, note: 'הערב במעריב: ותן טל ומטר', highlight: true };
+    } else {
+      vtenRow = { text: BORCHEINU };
     }
+    out.seasonal = [mashivRow, vtenRow];
   }
-  out.inserts = inserts;
 
   /* ---------- Weekday dynamic minyanim ---------- */
   const dow = dowOfKey(civilKey);
@@ -583,6 +601,33 @@ function computeBoard({ hebcal, now, tz, settings, dynamicRules, weekdayRules, s
 
   return out;
 }
+
+/* =====================================================================
+   AUTO-FIT: shrinks a panel's contents just enough that nothing is cut
+   off when extra boxes (fast, Chanukah, reminders) appear
+   ===================================================================== */
+const useFitToPanel = (fitKey) => {
+  const ref = useRef(null);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return undefined;
+    const panel = el.parentElement;
+    const fit = () => {
+      let z = 1;
+      el.style.zoom = '1';
+      while (panel.scrollHeight > panel.clientHeight + 1 && z > 0.6) {
+        z = Math.round((z - 0.04) * 100) / 100;
+        el.style.zoom = String(z);
+      }
+    };
+    fit();
+    let cancelled = false;
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { if (!cancelled) fit(); });
+    window.addEventListener('resize', fit);
+    return () => { cancelled = true; window.removeEventListener('resize', fit); };
+  }, [fitKey]);
+  return ref;
+};
 
 /* =====================================================================
    APP
@@ -780,6 +825,15 @@ const App = () => {
 
   const motzeiLabel = period && period.lastIsShabbos ? 'מוצאי שבת' : 'מוצאי יו״ט';
 
+  const fitKey = JSON.stringify([
+    board.zmanim, board.fast && [board.fast.name, board.fast.mode], board.chanukahTonight, finalInsertions, board.seasonal,
+    period, board.mevorchim, board.klActiveEnd, displayDaf, displayOmer, displayParsha, displayHaftarah, candleRows,
+    displayWeekdayMinyanim, displayShabbosMinyanim, board.holyMode, fontFamily, theme, simActive, !!loc
+  ]);
+  const todayFitRef = useFitToPanel(fitKey);
+  const minyanFitRef = useFitToPanel(fitKey);
+  const shabbosFitRef = useFitToPanel(fitKey);
+
   return (
     <>
       <style>{`
@@ -818,6 +872,8 @@ const App = () => {
         .main-grid { display: grid; grid-template-columns: 1fr 2fr 1fr; gap: 2vw; padding: 3vh 4vw; height: 75vh; }
 
         .panel { background-color: var(--bg-panel); border-radius: 16px; padding: 3vh 2vw; border: 1px solid var(--border-panel); overflow-y: hidden; display: flex; flex-direction: column; }
+        /* never squeeze the contents; the auto-fit hook scales them instead */
+        .panel-fit { display: flex; flex-direction: column; flex-shrink: 0; }
         .panel-header { font-size: 3.5vh; margin-bottom: 1.5vh; color: var(--accent); text-align: center; border-bottom: 2px solid var(--border); padding-bottom: 1vh; flex-shrink: 0; }
 
         .minyan-row { display: flex; justify-content: space-between; align-items: center; font-size: 2.6vh; margin-bottom: 1vh; background-color: var(--bg-row); padding: 1vh 2vw; border-radius: 8px; }
@@ -876,7 +932,8 @@ const App = () => {
         <main className="main-grid" style={{ height: simActive ? '72vh' : '75vh' }}>
           {/* ===== LEFT: TODAY ===== */}
           <div className="panel" style={{ padding: '2vh 1vw' }}>
-            <div className="panel-header">זמנים להיום</div>
+            <div className="panel-fit" ref={todayFitRef}>
+            <div className="panel-header">זמני היום</div>
 
             {board.fast && (
               <div style={{ backgroundColor: '#311b92', padding: '1vh', borderRadius: '6px', textAlign: 'center', marginBottom: '1.5vh', border: '1px solid #5e35b1' }}>
@@ -897,18 +954,19 @@ const App = () => {
             )}
 
             {board.chanukahTonight > 0 && (
-              <div style={{ backgroundColor: 'var(--bg-row)', padding: '1.5vh', borderRadius: '6px', textAlign: 'center', marginBottom: '1.5vh', border: '1px solid var(--accent)' }}>
-                <h4 style={{ color: 'var(--accent)', fontSize: '2vh', margin: '0 0 1.5vh 0', fontWeight: '900' }}>
-                  {board.chanukahTonight === 1 ? "חנוכה - הערב נר ראשון" : `חנוכה - הערב ${['', '', 'ב׳', 'ג׳', 'ד׳', 'ה׳', 'ו׳', 'ז׳', 'ח׳'][board.chanukahTonight]} נרות`}
+              <div style={{ backgroundColor: 'var(--bg-row)', padding: '0.8vh 1vh', borderRadius: '6px', textAlign: 'center', marginBottom: '1vh', border: '1px solid var(--accent)' }}>
+                <h4 style={{ color: 'var(--accent)', fontSize: '1.9vh', margin: '0 0 1.8vh 0', fontWeight: '900' }}>
+                  {board.chanukahTonight === 1 ? "חנוכה -  נר ראשון" : `חנוכה - ליל ${['', '', 'ב׳', 'ג׳', 'ד׳', 'ה׳', 'ו׳', 'ז׳', 'ח׳'][board.chanukahTonight]} נרות`}
                 </h4>
-                <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'flex-end', gap: '0.8vw', height: '4.5vh', paddingBottom: '0.5vh' }}>
+                {/* Laid out left-to-right so the first night's candle is on the right, as it is lit */}
+                <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'flex-end', gap: '0.8vw', height: '3.8vh', direction: 'ltr' }}>
                   {[8, 7, 6, 5, 0, 4, 3, 2, 1].map((dayTh, idx) => {
                     const isShamash = idx === 4;
                     const isLit = isShamash || (dayTh <= board.chanukahTonight && dayTh !== 0);
                     return (
-                      <div key={idx} style={{ width: '1.2vw', height: isShamash ? '4.5vh' : '3vh', backgroundColor: isLit ? 'var(--accent)' : 'var(--border)', borderRadius: '2px', position: 'relative' }}>
+                      <div key={idx} style={{ width: '1.2vw', height: isShamash ? '3.8vh' : '2.6vh', backgroundColor: isLit ? 'var(--accent)' : 'var(--border)', borderRadius: '2px', position: 'relative' }}>
                         {isLit && (
-                          <div style={{ position: 'absolute', top: '-2vh', left: '50%', transform: 'translateX(-50%)', width: '0.8vw', height: '1.5vh', backgroundColor: '#ffb300', borderRadius: '50% 50% 20% 20%', boxShadow: '0 0 10px #ffb300, 0 0 15px #ff8f00', animation: `flame-flicker ${1.5 + ((idx * 0.37) % 1)}s infinite alternate` }} />
+                          <div style={{ position: 'absolute', top: '-1.7vh', left: '50%', transform: 'translateX(-50%)', width: '0.8vw', height: '1.4vh', backgroundColor: '#ffb300', borderRadius: '50% 50% 20% 20%', boxShadow: '0 0 10px #ffb300, 0 0 15px #ff8f00', animation: `flame-flicker ${1.5 + ((idx * 0.37) % 1)}s infinite alternate` }} />
                         )}
                       </div>
                     );
@@ -918,9 +976,26 @@ const App = () => {
             )}
 
             {finalInsertions.length > 0 && (
-              <div style={{ backgroundColor: '#c62828', padding: '1vh', borderRadius: '6px', textAlign: 'center', marginBottom: '1.5vh' }}>
+              <div style={{ backgroundColor: '#c62828', padding: '0.8vh', borderRadius: '6px', textAlign: 'center', marginBottom: '1vh' }}>
                 <h4 style={{ color: '#ffcdd2', fontSize: '1.6vh', margin: '0 0 0.2vh 0' }}>תזכורת תפילה</h4>
                 {finalInsertions.map((ins, i) => (<div key={i} style={{ color: '#fff', fontSize: '2.2vh', fontWeight: 'bold' }}>{ins}</div>))}
+              </div>
+            )}
+
+            {board.seasonal && (
+              <div style={{ border: '1px solid var(--border)', borderRadius: '6px', overflow: 'hidden', marginBottom: '1vh', flexShrink: 0 }}>
+                {board.seasonal.map((row, i) => (
+                  <div key={i} style={{
+                    display: 'flex', justifyContent: 'center', alignItems: 'baseline', gap: '0.8vw', flexWrap: 'wrap',
+                    padding: '0.6vh 0.8vw', fontSize: '2.1vh', fontWeight: 'bold', textAlign: 'center',
+                    backgroundColor: row.highlight ? '#c62828' : 'var(--bg-row)',
+                    color: row.highlight ? '#fff' : 'var(--text-main)',
+                    borderTop: i > 0 ? '1px solid var(--border)' : 'none'
+                  }}>
+                    <span>{row.text}</span>
+                    {row.note && <span style={{ fontSize: '1.6vh', fontWeight: 'normal', color: '#ffcdd2' }}>({row.note})</span>}
+                  </div>
+                ))}
               </div>
             )}
 
@@ -938,19 +1013,21 @@ const App = () => {
               </div>
             ) : (
               <div style={{ textAlign: 'center', marginTop: '5vh', color: 'var(--text-sec)' }}>
-                {!loc ? 'לא הוגדר מיקום לבית הכנסת' : 'טוען זמנים...'}
+                {!loc ? 'No location has been set' : 'Loading Zemanim...'}
               </div>
             )}
+            </div>
           </div>
 
           {/* ===== CENTER: MINYANIM ===== */}
           <div className="panel" style={{ backgroundColor: 'var(--bg-center)' }}>
+            <div className="panel-fit" ref={minyanFitRef}>
             {!board.holyMode && (
               <>
                 <div className="panel-header" style={{ fontSize: '4vh', paddingBottom: '0.5vh', marginBottom: '1vh' }}>ימי החול</div>
                 <div style={{ display: 'flex', flexDirection: 'column', flex: 1 }}>
                   {displayWeekdayMinyanim.length === 0 ? (
-                    <div style={{ textAlign: 'center', color: 'var(--text-sec)', marginTop: '2vh' }}>אין זמני תפילה מוגדרים</div>
+                    <div style={{ textAlign: 'center', color: 'var(--text-sec)', marginTop: '2vh' }}> זמני תפילה are not set</div>
                   ) : (
                     displayWeekdayMinyanim.map((minyan) => (
                       <div key={minyan.id} className="minyan-row">
@@ -987,10 +1064,12 @@ const App = () => {
                 </div>
               </>
             )}
+            </div>
           </div>
 
           {/* ===== RIGHT: SHABBOS / YOM TOV ===== */}
           <div className="panel" style={{ padding: '2vh 1vw' }}>
+            <div className="panel-fit" ref={shabbosFitRef}>
             {(displayDaf || displayOmer) && (
               <div style={{ marginBottom: '1vh' }}>
                 {displayDaf && <div className="compact-row"><span>דף היומי:</span><span style={{ fontWeight: 'bold', color: theme === 'light' ? '#1565c0' : '#64b5f6' }}>{displayDaf}</span></div>}
@@ -1012,7 +1091,7 @@ const App = () => {
                 {period.tzeis && <div className="compact-row"><span>צאת הכוכבים:</span><span className="val">{period.tzeis}</span></div>}
                 {period.m60 && <div className="compact-row"><span>{motzeiLabel} (60׳):</span><span className="val">{period.m60}</span></div>}
                 {period.m72 && <div className="compact-row"><span>צאת (72 דק׳ משקיעה):</span><span className="val">{period.m72}</span></div>}
-                {!board.mevorchim && board.klActiveEnd && <div className="compact-row"><span>סוף זמן קידוש לבנה:</span><span className="val" style={{ direction: 'rtl' }}>{board.klActiveEnd}</span></div>}
+                {!board.mevorchim && board.klActiveEnd && <div className="compact-row"><span>סוף זמן קידוש לבנה:</span><span className="val" style={{ direction: 'ltr', unicodeBidi: 'isolate' }}>{board.klActiveEnd}</span></div>}
               </div>
             )}
             {board.mevorchim && (
@@ -1021,11 +1100,12 @@ const App = () => {
                 <div style={{ backgroundColor: 'var(--bg-row)', color: 'var(--text-main)', padding: '0.4vh', textAlign: 'center', fontSize: '1.6vh' }}>{board.mevorchim.rcDays}</div>
                 <div style={{ backgroundColor: 'var(--bg-row)', color: 'var(--text-main)', padding: '0.4vh', textAlign: 'center', fontSize: '1.6vh', borderBottom: '1px solid var(--border)' }}>{board.mevorchim.molad}</div>
                 <div style={{ backgroundColor: 'var(--bg-panel)', color: 'var(--text-main)', padding: '0.6vh 1vw', fontSize: '1.6vh' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px dotted var(--border)', paddingBottom: '0.3vh', marginBottom: '0.3vh' }}><span>קידוש לבנה (תחילה):</span><span style={{ fontWeight: 'bold' }}>{board.mevorchim.klStart}</span></div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>קידוש לבנה (סוף):</span><span style={{ fontWeight: 'bold' }}>{board.mevorchim.klEnd}</span></div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px dotted var(--border)', paddingBottom: '0.3vh', marginBottom: '0.3vh' }}><span>קידוש לבנה (תחילה):</span><span style={{ fontWeight: 'bold', direction: 'ltr', unicodeBidi: 'isolate' }}>{board.mevorchim.klStart}</span></div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>קידוש לבנה (סוף):</span><span style={{ fontWeight: 'bold', direction: 'ltr', unicodeBidi: 'isolate' }}>{board.mevorchim.klEnd}</span></div>
                 </div>
               </div>
             )}
+            </div>
           </div>
         </main>
 
