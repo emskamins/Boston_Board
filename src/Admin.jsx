@@ -71,6 +71,48 @@ const useNow = (ms) => {
 };
 
 /* =====================================================================
+   NUSACH & SPELLING
+   ===================================================================== */
+const NUSACH_OPTIONS = [
+  { value: 'ashkenaz', label: 'Ashkenaz (אשכנז)' },
+  { value: 'sefard', label: 'Sefard (ספרד)' },
+  { value: 'edot', label: 'Edot HaMizrach (עדות המזרח)' }
+];
+// Filled in when a nusach is chosen; each can still be changed afterwards
+const NUSACH_DEFAULTS = {
+  ashkenaz: { spelling: 'ashkenazi', klStartDays: 3, klEndOpinion: '15days' },
+  sefard: { spelling: 'ashkenazi', klStartDays: 7, klEndOpinion: '15days' },
+  edot: { spelling: 'sefardi', klStartDays: 7, klEndOpinion: 'between_moldos' }
+};
+const BIRKAS_HASHANIM = {
+  ashkenaz: { winter: 'ותן טל ומטר לברכה', summer: 'ותן ברכה' },
+  sefard: { winter: 'ברך עלינו (ותן טל ומטר)', summer: 'ברכנו' },
+  edot: { winter: 'ברך עלינו', summer: 'ברכנו' }
+};
+
+// Spelling style for English transliterations in this panel. Set on every render of <Admin>.
+let currentSpelling = 'ashkenazi';
+const SEFARDI_SPELLING = [
+  [/Motzei Shabbos/g, 'Motzaei Shabbat'],
+  [/Shabbos/g, 'Shabbat'],
+  [/Tzeis/g, 'Tzeit'],
+  [/Chatzos/g, 'Chatzot'],
+  [/\bAlos\b/g, 'Alot'],
+  [/\bShkia\b/g, 'Shkiah'],
+  [/Atzeres/g, 'Atzeret'],
+  [/Sukkos/g, 'Sukkot'],
+  [/Rosh Chodesh/g, 'Rosh Hodesh'],
+  [/Chol Ha[Mm]oed/g, 'Hol HaMoed'],
+  [/Cheshvan/g, 'Heshvan'],
+  [/V'sen/g, "V'ten"],
+  [/\bParsha\b/g, 'Parasha'],
+  [/\bparsha\b/g, 'parasha'],
+  [/Shacharis/g, 'Shacharit'],
+  [/Birkas/g, 'Birkat']
+];
+const tx = (str) => (currentSpelling === 'sefardi' ? SEFARDI_SPELLING.reduce((acc, [re, to]) => acc.replace(re, to), String(str)) : str);
+
+/* =====================================================================
    CHANGE HISTORY
    Every admin change goes through commit(): it reads the old values,
    writes the new ones and a history entry in one atomic update, so any
@@ -129,8 +171,9 @@ const ANCHOR_NAMES = {
 const shortText = (t) => { const s = String(t || ''); return s.length > 40 ? `${s.slice(0, 40)}…` : s; };
 const describeOffset = (offset, anchorName) => {
   const n = Number(offset) || 0;
-  if (n === 0) return `at ${anchorName}`;
-  return `${Math.abs(n)} min ${n < 0 ? 'before' : 'after'} ${anchorName}`;
+  const name = tx(anchorName);
+  if (n === 0) return `at ${name}`;
+  return `${Math.abs(n)} min ${n < 0 ? 'before' : 'after'} ${name}`;
 };
 const describeMinyan = (m, withDay) => `"${m.label} ${m.time}"${withDay ? ` (${m.day === 'erev' ? 'Fri night' : 'Sat'})` : ''}`;
 const describeShabbosRule = (r) => `"${r.label}" ${describeOffset(r.offset, BASE_NAMES[r.base] || r.base)}`;
@@ -229,7 +272,7 @@ const ManualMinyanRow = ({ minyan, dbPath, withDay }) => {
     setTm(minyan.time || '');
   }, [minyan.label, minyan.time]);
 
-  const section = SECTION_NAMES[dbPath] || dbPath;
+  const section = tx(SECTION_NAMES[dbPath] || dbPath);
   const write = (data) => commit(
     { [`${dbPath}/${minyan.id}`]: data },
     `Changed ${section} ${describeMinyan(minyan, withDay)} → ${describeMinyan(data, withDay)}`
@@ -286,7 +329,7 @@ const DynamicMinyanRow = ({ minyan }) => {
 
   const write = (data) => commit(
     { [`dynamic_rules/${minyan.id}`]: data },
-    `Changed Shabbos rule ${describeShabbosRule(minyan)} → ${describeShabbosRule(data)}`
+    `${tx('Changed Shabbos rule')} ${describeShabbosRule(minyan)} → ${describeShabbosRule(data)}`
   )
     .then(() => show('ok', '✓ Saved'))
     .catch(() => show('err', 'Save failed - check your connection or permissions.'));
@@ -308,7 +351,7 @@ const DynamicMinyanRow = ({ minyan }) => {
 
   const handleDelete = () => {
     if (window.confirm(`Delete the rule "${minyan.label}"?`)) {
-      commit({ [`dynamic_rules/${minyan.id}`]: null }, `Deleted Shabbos rule ${describeShabbosRule(minyan)}`)
+      commit({ [`dynamic_rules/${minyan.id}`]: null }, `${tx('Deleted Shabbos rule')} ${describeShabbosRule(minyan)}`)
         .catch(() => show('err', 'Delete failed.'));
     }
   };
@@ -322,10 +365,10 @@ const DynamicMinyanRow = ({ minyan }) => {
         <input type="number" value={offset} onChange={e => setOffset(e.target.value)} onBlur={handleSave} onKeyDown={onKey} className="form-control" style={{ width: '70px', background: 'transparent', padding: '6px' }} />
         <span style={{ fontSize: '13px', color: '#64748b' }}>mins from</span>
         <select value={base} onChange={e => handleSelect({ base: e.target.value, round: minyan.round || defaultRound(e.target.value) })} className="form-control" style={{ flex: 1, minWidth: '110px', background: 'transparent', padding: '6px' }}>
-          <option value="friday_candle">Fri: Candles</option>
-          <option value="friday_shkia">Fri: Shkia</option>
-          <option value="shabbos_shkia">Shab: Shkia</option>
-          <option value="shabbos_tzeis">Shab: Tzeis</option>
+          <option value="friday_candle">{tx('Fri: Candles')}</option>
+          <option value="friday_shkia">{tx('Fri: Shkia')}</option>
+          <option value="shabbos_shkia">{tx('Shab: Shkia')}</option>
+          <option value="shabbos_tzeis">{tx('Shab: Tzeis')}</option>
         </select>
         <select value={round} onChange={e => handleSelect({ round: e.target.value })} className="form-control" style={{ flex: 1, minWidth: '140px', background: 'transparent', padding: '6px' }}>
           {ROUND_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
@@ -389,7 +432,7 @@ const WeekdayRuleRow = ({ rule }) => {
         <input type="number" value={offset} onChange={e => setOffset(e.target.value)} onBlur={handleSave} onKeyDown={onKey} className="form-control" style={{ width: '70px', background: 'transparent', padding: '6px' }} />
         <span style={{ fontSize: '13px', color: '#64748b' }}>mins from</span>
         <select value={anchor} onChange={e => handleChange({ anchor: e.target.value })} className="form-control" style={{ flex: 1, minWidth: '130px', background: 'transparent', padding: '6px' }}>
-          {WEEKDAY_ANCHOR_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+          {WEEKDAY_ANCHOR_OPTIONS.map(o => <option key={o.value} value={o.value}>{tx(o.label)}</option>)}
         </select>
         <select value={weekly} onChange={e => handleChange({ weekly: e.target.value })} className="form-control" style={{ flex: 1, minWidth: '160px', background: 'transparent', padding: '6px' }}>
           {WEEKLY_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
@@ -481,6 +524,14 @@ const Admin = () => {
   const [simDate, setSimDate] = useState("");
   const [simTime, setSimTime] = useState("");
   const [simSt, showSim] = useStatus();
+  const [nusachSt, showNusach] = useStatus();
+
+  const nusach = NUSACH_DEFAULTS[settings.nusach] ? settings.nusach : 'ashkenaz';
+  const spelling = settings.spelling === 'sefardi' || settings.spelling === 'ashkenazi' ? settings.spelling : NUSACH_DEFAULTS[nusach].spelling;
+  currentSpelling = spelling; // read by tx() in this render and its child rows
+  const W = BIRKAS_HASHANIM[nusach];
+  const silentSummer = nusach === 'ashkenaz' && settings.il !== true;
+  const maarivWord = nusach === 'edot' ? 'ערבית' : 'מעריב';
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
@@ -634,7 +685,7 @@ const Admin = () => {
     const time = resolveTime(shabbosTime, (msg) => showShabbos('err', msg));
     if (time === null) return;
     const item = { label: shabbosLabel.trim(), time, day: shabbosDay };
-    commit({ [`shabbos_minyanim/${push(ref(db, 'shabbos_minyanim')).key}`]: item }, `Added Shabbos minyan ${describeMinyan(item, true)}`)
+    commit({ [`shabbos_minyanim/${push(ref(db, 'shabbos_minyanim')).key}`]: item }, `${tx('Added Shabbos minyan')} ${describeMinyan(item, true)}`)
       .then(() => showShabbos('ok', `✓ Added ${item.label} ${time}`))
       .catch(() => showShabbos('err', 'Save failed.'));
     setShabbosLabel(""); setShabbosTime("");
@@ -645,7 +696,7 @@ const Admin = () => {
     if (!dynLabel.trim()) return showDyn('err', 'Enter a name.');
     if (dynOffset.trim() === '' || !Number.isFinite(Number(dynOffset))) return showDyn('err', 'Enter minutes, e.g. -20 or 15.');
     const item = { label: dynLabel.trim(), base: dynBase, offset: Number(dynOffset), round: dynRound };
-    commit({ [`dynamic_rules/${push(ref(db, 'dynamic_rules')).key}`]: item }, `Added Shabbos rule ${describeShabbosRule(item)}`)
+    commit({ [`dynamic_rules/${push(ref(db, 'dynamic_rules')).key}`]: item }, `${tx('Added Shabbos rule')} ${describeShabbosRule(item)}`)
       .then(() => showDyn('ok', `✓ Added ${item.label}`))
       .catch(() => showDyn('err', 'Save failed.'));
     setDynLabel(""); setDynOffset("");
@@ -669,11 +720,11 @@ const Admin = () => {
   const setSeasonalMode = (mode) => commit({ seasonal_tefillah: { ...seasonal, mode } }, `Set seasonal inserts to ${mode === 'manual' ? 'Manual' : 'Automatic'}`);
   const toggleMashiv = () => commit(
     { seasonal_tefillah: { ...seasonal, mode: 'manual', mashivHaruach: !seasonal.mashivHaruach } },
-    `Set seasonal insert to ${!seasonal.mashivHaruach ? 'משיב הרוח' : 'מוריד הטל'} (manual)`
+    `Set seasonal insert to ${!seasonal.mashivHaruach ? 'משיב הרוח' : (silentSummer ? 'summer (nothing said)' : 'מוריד הטל')} (manual)`
   );
   const toggleVten = () => commit(
     { seasonal_tefillah: { ...seasonal, mode: 'manual', vtenTal: !seasonal.vtenTal } },
-    `Set seasonal insert to ${!seasonal.vtenTal ? 'ותן טל ומטר' : 'ברכנו'} (manual)`
+    `Set seasonal insert to ${!seasonal.vtenTal ? W.winter : W.summer} (manual)`
   );
   const setSetting = (key, value, summary) => commit({ [`settings/${key}`]: value }, summary);
 
@@ -723,7 +774,7 @@ const Admin = () => {
 
   const handleSetIl = (value) => {
     setSetting('il', value, `Switched calendar to ${value ? 'Eretz Yisrael' : 'Chutz Laaretz'}`)
-      .then(() => showIl('ok', value ? '✓ Israel: one-day Yom Tov, Israeli parsha schedule, V\'sen Tal from 7 Cheshvan.' : '✓ Chutz Laaretz: two-day Yom Tov, Chutz Laaretz parsha schedule, V\'sen Tal from Dec 4/5.', 6000));
+      .then(() => showIl('ok', tx(value ? '✓ Eretz Yisrael: one-day Yom Tov, Eretz Yisrael parsha schedule, V\'sen Tal from 7 Cheshvan.' : '✓ Chutz Laaretz: two-day Yom Tov, Chutz Laaretz parsha schedule, V\'sen Tal from Dec 4/5.'), 6000));
   };
 
   const handleSaveHalacha = (e) => {
@@ -735,7 +786,7 @@ const Admin = () => {
     if (Number(settings.candleMinutes ?? 18) !== mins) diffs.push(`candle lighting ${settings.candleMinutes ?? 18} → ${mins} min`);
     if (Number(settings.klStartDays ?? 3) !== klDays) diffs.push(`Kiddush Levana start ${settings.klStartDays ?? 3} → ${klDays} days`);
     if ((settings.klEndOpinion || '15days') !== klEndOpinion) diffs.push(`Kiddush Levana end → ${klEndOpinion === 'between_moldos' ? 'Mechaber' : 'Rema'}`);
-    if ((settings.omerRollover || 'tzeis') !== omerRollover) diffs.push(`Omer changes at ${omerRollover === 'shkia' ? 'Shkia' : 'Tzeis'}`);
+    if ((settings.omerRollover || 'tzeis') !== omerRollover) diffs.push(tx(`Omer changes at ${omerRollover === 'shkia' ? 'Shkia' : 'Tzeis'}`));
     commit({
       'settings/candleMinutes': mins,
       'settings/klStartDays': klDays,
@@ -769,7 +820,7 @@ const Admin = () => {
     const anySet = fields.some(f => clean[f]);
     clean.expires = anySet ? (overrides.expires || nextSundayKey()) : '';
     const setNames = { parsha: 'parsha', haftarah: 'haftarah', daf: 'daf', omer: 'omer', candles: 'candle lighting' };
-    commit({ overrides: clean }, anySet ? `Set overrides (${fields.filter(f => clean[f]).map(f => setNames[f]).join(', ')}) through ${clean.expires}` : 'Cleared override values')
+    commit({ overrides: clean }, anySet ? tx(`Set overrides (${fields.filter(f => clean[f]).map(f => setNames[f]).join(', ')}) through ${clean.expires}`) : 'Cleared override values')
       .then((did) => showOverride('ok', !did ? 'No changes to save.' : anySet ? `✓ Saved. Overrides stop showing after ${clean.expires}.` : '✓ Saved.', 6000))
       .catch(() => showOverride('err', 'Save failed.'));
   };
@@ -777,6 +828,25 @@ const Admin = () => {
   const handleClearOverrides = () => {
     if (!window.confirm('Clear all overrides and go back to automatic values?')) return;
     commit({ overrides: null }, 'Cleared all overrides').then(() => showOverride('ok', '✓ All overrides cleared.', 4000));
+  };
+
+  /* ---------- Nusach & spelling ---------- */
+  const handleSetNusach = (value) => {
+    if (value === nusach && settings.nusach) return;
+    const d = NUSACH_DEFAULTS[value];
+    const label = NUSACH_OPTIONS.find(o => o.value === value).label;
+    commit({
+      'settings/nusach': value,
+      'settings/spelling': d.spelling,
+      'settings/klStartDays': d.klStartDays,
+      'settings/klEndOpinion': d.klEndOpinion
+    }, `Switched nusach to ${label}`)
+      .then(() => showNusach('ok', `✓ Nusach set to ${label}. Also set: ${d.spelling === 'sefardi' ? 'Sefardi' : 'Ashkenazi'} spelling, Kiddush Levana from ${d.klStartDays} days until ${d.klEndOpinion === 'between_moldos' ? 'halfway between moldos (Mechaber)' : '15 days (Rema)'}. You can change any of these.`, 9000))
+      .catch(() => showNusach('err', 'Save failed.'));
+  };
+  const handleSetSpelling = (value) => {
+    commit({ 'settings/spelling': value }, `Changed spelling style to ${value === 'sefardi' ? 'Sefardi' : 'Ashkenazi'}`)
+      .catch(() => showNusach('err', 'Save failed.'));
   };
 
   /* ---------- Simulation ---------- */
@@ -974,8 +1044,8 @@ const Admin = () => {
               {simActive ? "⚠️ Simulation Mode Active" : "🧪 Testing & Simulation"}
             </h3>
             <div className="help-box">
-              Jump the display to any date and time to test zmanim, Shkia rollovers, fast days and Shabbos layouts.
-              The simulated clock keeps running from the time you choose, so you can watch Shkia or Tzeis pass.
+              {tx('Jump the display to any date and time to test zmanim, Shkia rollovers, fast days and Shabbos layouts.')}{' '}
+              {tx('The simulated clock keeps running from the time you choose, so you can watch Shkia or Tzeis pass.')}
               Simulation turns itself off after 12 hours.
             </div>
             {simActive && (
@@ -1060,6 +1130,24 @@ const Admin = () => {
             <StatusText st={locMode === 'zip' ? zipSt : coordSt} />
 
             <div style={{ marginTop: '20px', borderTop: '1px solid #f3f4f6', paddingTop: '20px' }}>
+              <label style={{ fontSize: '13px', fontWeight: 600, color: '#4b5563', display: 'block', marginBottom: '8px' }}>Nusach:</label>
+              <div className="toggle-group">
+                {NUSACH_OPTIONS.map(o => (
+                  <button key={o.value} type="button" onClick={() => handleSetNusach(o.value)} className={`toggle-btn ${nusach === o.value ? 'active' : ''}`}>{o.label}</button>
+                ))}
+              </div>
+              <div style={{ fontSize: '13px', color: '#64748b', marginTop: '6px' }}>
+                Sets the seasonal wording on the board, the Omer wording, and (for Edot HaMizrach) the Sefardi haftarah.
+              </div>
+              <StatusText st={nusachSt} />
+              <label style={{ fontSize: '13px', fontWeight: 600, color: '#4b5563', display: 'block', margin: '15px 0 8px' }}>Spelling style in this panel:</label>
+              <div className="toggle-group">
+                <button type="button" onClick={() => handleSetSpelling('ashkenazi')} className={`toggle-btn ${spelling === 'ashkenazi' ? 'active' : ''}`}>Ashkenazi (Shabbos, Tzeis)</button>
+                <button type="button" onClick={() => handleSetSpelling('sefardi')} className={`toggle-btn ${spelling === 'sefardi' ? 'active' : ''}`}>Sefardi (Shabbat, Tzeit)</button>
+              </div>
+            </div>
+
+            <div style={{ marginTop: '20px', borderTop: '1px solid #f3f4f6', paddingTop: '20px' }}>
               <label style={{ fontSize: '13px', fontWeight: 600, color: '#4b5563', display: 'block', marginBottom: '8px' }}>Calendar:</label>
               <div className="toggle-group">
                 <button type="button" onClick={() => handleSetIl(false)} className={`toggle-btn ${settings.il !== true ? 'active' : ''}`}>Chutz Laaretz (חוץ לארץ)</button>
@@ -1071,14 +1159,14 @@ const Admin = () => {
             <form onSubmit={handleSaveHalacha} style={{ marginTop: '20px', borderTop: '1px solid #f3f4f6', paddingTop: '20px' }}>
               <div className="form-row">
                 <div className="form-group">
-                  <label>Candle lighting (minutes before Shkia; Jerusalem uses 40)</label>
+                  <label>{tx('Candle lighting (minutes before Shkia; Jerusalem uses 40)')}</label>
                   <input type="number" min="10" max="60" value={candleMinutes} onChange={(e) => setCandleMinutes(e.target.value)} className="form-control" />
                 </div>
                 <div className="form-group">
                   <label>Omer count changes at</label>
                   <select value={omerRollover} onChange={(e) => setOmerRollover(e.target.value)} className="form-control">
-                    <option value="tzeis">Tzeis (nightfall)</option>
-                    <option value="shkia">Shkia (sunset)</option>
+                    <option value="tzeis">{tx('Tzeis (nightfall)')}</option>
+                    <option value="shkia">{tx('Shkia (sunset)')}</option>
                   </select>
                 </div>
               </div>
@@ -1160,17 +1248,17 @@ const Admin = () => {
             </div>
             {seasonal.mode !== 'manual' ? (
               <div style={{ fontSize: '14px', color: '#4b5563', lineHeight: 1.5 }}>
-                משיב הרוח starts at Musaf of Shemini Atzeres and stops at Musaf of the first day of Pesach.
-                ותן טל ומטר starts at Maariv of {settings.il === true ? '7 Cheshvan (Israel)' : 'December 4, or December 5 before a civil leap year (Chutz Laaretz)'} and
-                ends after Mincha of Erev Pesach. The board always shows which version to say (משיב הרוח or מוריד הטל, ותן טל ומטר or ברכנו) and highlights the day each one changes.
+                {tx(`Second bracha: משיב הרוח ומוריד הגשם from Musaf of Shemini Atzeres until Musaf of the first day of Pesach; then ${silentSummer ? 'nothing is said (the board shows "אין אומרים מוריד הטל" for the first month)' : 'מוריד הטל'}.`)}
+                {' '}{tx(`Birkas HaShanim: ${W.winter} from Maariv of ${settings.il === true ? '7 Cheshvan (Eretz Yisrael)' : 'December 4, or December 5 before a civil leap year (Chutz Laaretz)'} until Mincha of Erev Pesach; then ${W.summer}.`)}
+                {' '}The board always shows which version to say and highlights the day each one changes.
               </div>
             ) : (
               <div className="toggle-group">
                 <button onClick={toggleMashiv} className={`toggle-btn ${seasonal.mashivHaruach ? 'toggle-on' : 'toggle-off'}`}>
-                  {seasonal.mashivHaruach ? "✓ משיב הרוח" : "מוריד הטל"}
+                  {seasonal.mashivHaruach ? "✓ משיב הרוח" : (silentSummer ? "(nothing said in summer)" : "מוריד הטל")}
                 </button>
                 <button onClick={toggleVten} className={`toggle-btn ${seasonal.vtenTal ? 'toggle-on' : 'toggle-off'}`}>
-                  {seasonal.vtenTal ? "✓ ותן טל ומטר" : "ברכנו"}
+                  {seasonal.vtenTal ? `✓ ${W.winter}` : W.summer}
                 </button>
               </div>
             )}
@@ -1188,7 +1276,7 @@ const Admin = () => {
               <button type="button" onClick={() => { setMinyanLabel('שחרית'); setMinyanTime('7:00 AM'); }} className="btn btn-secondary" style={{ fontSize: '13px', padding: '6px 12px', height: 'auto' }}>שחרית 7:00</button>
               <button type="button" onClick={() => { setMinyanLabel('שחרית'); setMinyanTime('8:00 AM'); }} className="btn btn-secondary" style={{ fontSize: '13px', padding: '6px 12px', height: 'auto' }}>שחרית 8:00</button>
               <button type="button" onClick={() => { setMinyanLabel('מנחה'); setMinyanTime('6:00 PM'); }} className="btn btn-secondary" style={{ fontSize: '13px', padding: '6px 12px', height: 'auto' }}>מנחה 6:00</button>
-              <button type="button" onClick={() => { setMinyanLabel('מעריב'); setMinyanTime('10:00 PM'); }} className="btn btn-secondary" style={{ fontSize: '13px', padding: '6px 12px', height: 'auto' }}>מעריב 10:00</button>
+              <button type="button" onClick={() => { setMinyanLabel(maarivWord); setMinyanTime('10:00 PM'); }} className="btn btn-secondary" style={{ fontSize: '13px', padding: '6px 12px', height: 'auto' }}>{maarivWord} 10:00</button>
             </div>
 
             <form onSubmit={handleAddManual} className="form-row">
@@ -1215,8 +1303,8 @@ const Admin = () => {
           <div className="card">
             <h3>🌅 Weekday Schedule (Dynamic)</h3>
             <div className="help-box">
-              Minyanim that follow the sun, like "Mincha 15 minutes before Shkia". Use a negative number for before, positive for after.
-              "Same all week" gives one steady time based on the earliest (or latest) Shkia of the week, so people don't have to check every day.
+              {tx('Minyanim that follow the sun, like "Mincha 15 minutes before Shkia". Use a negative number for before, positive for after.')}{' '}
+              {tx('"Same all week" gives one steady time based on the earliest (or latest) Shkia of the week, so people don\'t have to check every day.')}
               These appear alongside your fixed weekday times on the selected days.
             </div>
             <form onSubmit={handleAddWeekdayRule}>
@@ -1232,7 +1320,7 @@ const Admin = () => {
                 <div className="form-group" style={{ flex: 2 }}>
                   <label>From</label>
                   <select value={wkAnchor} onChange={(e) => setWkAnchor(e.target.value)} className="form-control">
-                    {WEEKDAY_ANCHOR_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                    {WEEKDAY_ANCHOR_OPTIONS.map(o => <option key={o.value} value={o.value}>{tx(o.label)}</option>)}
                   </select>
                 </div>
               </div>
@@ -1264,7 +1352,7 @@ const Admin = () => {
 
           {/* ===== SHABBOS FIXED ===== */}
           <div className="card">
-            <h3>🍷 Shabbos Schedule (Fixed Times)</h3>
+            <h3>🍷 {tx('Shabbos Schedule (Fixed Times)')}</h3>
             <div className="help-box">
               Choose whether each minyan is Friday night or Saturday, so the board lists Friday night first.
               Older entries without a day are treated as Saturday; set the day on any Friday-night entries below.
@@ -1304,11 +1392,9 @@ const Admin = () => {
 
           {/* ===== DYNAMIC ===== */}
           <div className="card">
-            <h3>⚙️ Shabbos & Yom Tov (Dynamic)</h3>
+            <h3>⚙️ {tx('Shabbos & Yom Tov (Dynamic)')}</h3>
             <div className="help-box">
-              These times are calculated from candle lighting, Shkia or Tzeis each week. For Yom Tov, "Fri" anchors use Erev Yom Tov,
-              "Shab: Shkia" uses Shabbos (or the first day of Yom Tov), and "Shab: Tzeis" uses the last day.
-              Times anchored to Shkia round earlier by default so a minyan is never listed later than the rule allows.
+              {tx('These times are calculated from candle lighting, Shkia or Tzeis each week. For Yom Tov, "Fri" anchors use Erev Yom Tov, "Shab: Shkia" uses Shabbos (or the first day of Yom Tov), and "Shab: Tzeis" uses the last day. Times anchored to Shkia round earlier by default so a minyan is never listed later than the rule allows.')}
             </div>
 
             <form onSubmit={handleAddDynamic} className="form-row">
@@ -1319,10 +1405,10 @@ const Admin = () => {
               <div className="form-group" style={{ flex: 2 }}>
                 <label>Anchor Time</label>
                 <select value={dynBase} onChange={(e) => { setDynBase(e.target.value); setDynRound(defaultRound(e.target.value)); }} className="form-control">
-                  <option value="friday_candle">Friday: Candle Lighting</option>
-                  <option value="friday_shkia">Friday: Shkia</option>
-                  <option value="shabbos_shkia">Shabbos: Shkia</option>
-                  <option value="shabbos_tzeis">Shabbos: Tzeis</option>
+                  <option value="friday_candle">{tx('Friday: Candle Lighting')}</option>
+                  <option value="friday_shkia">{tx('Friday: Shkia')}</option>
+                  <option value="shabbos_shkia">{tx('Shabbos: Shkia')}</option>
+                  <option value="shabbos_tzeis">{tx('Shabbos: Tzeis')}</option>
                 </select>
               </div>
               <div className="form-group" style={{ flex: 1 }}>
@@ -1377,7 +1463,7 @@ const Admin = () => {
             </div>
             <form onSubmit={handleSaveOverrides}>
               <div className="form-row">
-                <div className="form-group"><label>Parsha Override</label><input type="text" value={overrides.parsha} onChange={(e) => setOverrides({ ...overrides, parsha: e.target.value })} placeholder="Auto" dir="auto" className="form-control" /></div>
+                <div className="form-group"><label>{tx('Parsha Override')}</label><input type="text" value={overrides.parsha} onChange={(e) => setOverrides({ ...overrides, parsha: e.target.value })} placeholder="Auto" dir="auto" className="form-control" /></div>
                 <div className="form-group"><label>Haftarah Override</label><input type="text" value={overrides.haftarah} onChange={(e) => setOverrides({ ...overrides, haftarah: e.target.value })} placeholder="Auto" dir="auto" className="form-control" /></div>
               </div>
               <div className="form-row">

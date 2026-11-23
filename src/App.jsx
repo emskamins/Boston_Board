@@ -276,6 +276,54 @@ const vtenOn = (key, il) => {
 };
 
 /* =====================================================================
+   NUSACH: seasonal wording and Sefiras HaOmer text
+   ===================================================================== */
+const NUSACHIM = ['ashkenaz', 'sefard', 'edot'];
+const nusachOf = (settings) => (NUSACHIM.includes(settings.nusach) ? settings.nusach : 'ashkenaz');
+
+const MASHIV_TEXT = "משיב הרוח ומוריד הגשם";
+const MORID_TEXT = "מוריד הטל";
+// Birkas HaShanim: winter / summer wording, and a short name for notes
+const BIRKAS_HASHANIM = {
+  ashkenaz: { winter: "ותן טל ומטר לברכה", summer: "ותן ברכה", short: "ותן טל ומטר" },
+  sefard: { winter: "ברך עלינו (ותן טל ומטר)", summer: "ברכנו", short: "ברך עלינו" },
+  edot: { winter: "ברך עלינו", summer: "ברכנו", short: "ברך עלינו" }
+};
+
+const omerDayOf = (key) => {
+  const hd = hdOfKey(key), m = hd.getMonth(), d = hd.getDate();
+  if (m === months.NISAN && d >= 16) return d - 15;
+  if (m === months.IYYAR) return 15 + d;
+  if (m === months.SIVAN && d <= 5) return 44 + d;
+  return 0;
+};
+
+const OMER_UNITS = ['', 'אחד', 'שנים', 'שלשה', 'ארבעה', 'חמשה', 'ששה', 'שבעה', 'שמונה', 'תשעה'];
+const OMER_FIRST_TEN = ['', 'יום אחד', 'שני ימים', 'שלשה ימים', 'ארבעה ימים', 'חמשה ימים', 'ששה ימים', 'שבעה ימים', 'שמונה ימים', 'תשעה ימים', 'עשרה ימים'];
+const OMER_TENS = { 2: 'עשרים', 3: 'שלשים', 4: 'ארבעים' };
+const OMER_WEEKS = ['', 'שבוע אחד', 'שני שבועות', 'שלשה שבועות', 'ארבעה שבועות', 'חמשה שבועות', 'ששה שבועות', 'שבעה שבועות'];
+const OMER_REMAINDER = ['', 'ויום אחד', 'ושני ימים', 'ושלשה ימים', 'וארבעה ימים', 'וחמשה ימים', 'וששה ימים'];
+
+const omerDays = (n) => {
+  if (n <= 10) return OMER_FIRST_TEN[n];
+  if (n < 20) return `${OMER_UNITS[n - 10]} עשר יום`;
+  const t = Math.floor(n / 10), u = n % 10;
+  return u ? `${OMER_UNITS[u]} ו${OMER_TENS[t]} יום` : `${OMER_TENS[t]} יום`;
+};
+
+// Ashkenaz: "...שהם שבוע אחד ויום אחד בעומר"; Sefard: same with "לעומר";
+// Edot HaMizrach: "היום שמונה ימים לעומר, שהם שבוע אחד ויום אחד"
+const omerText = (n, nusach) => {
+  if (!n) return '';
+  const word = nusach === 'ashkenaz' ? 'בעומר' : 'לעומר';
+  const base = `היום ${omerDays(n)}`;
+  if (n < 7) return `${base} ${word}`;
+  const w = Math.floor(n / 7), r = n % 7;
+  const weeks = `שהם ${OMER_WEEKS[w]}${r ? ` ${OMER_REMAINDER[r]}` : ''}`;
+  return nusach === 'edot' ? `${base} ${word}, ${weeks}` : `${base} ${weeks} ${word}`;
+};
+
+/* =====================================================================
    WEEKDAY DYNAMIC ANCHORS
    ===================================================================== */
 const WEEKDAY_ANCHORS = {
@@ -333,6 +381,7 @@ function computeBoard({ hebcal, now, tz, settings, dynamicRules, weekdayRules, s
   const candleMins = Number(settings.candleMinutes) > 0 ? Number(settings.candleMinutes) : 18;
   const klStartDays = Number(settings.klStartDays) === 7 ? 7 : 3;
   const klEndOpinion = settings.klEndOpinion === 'between_moldos' ? 'between_moldos' : '15days';
+  const nusach = nusachOf(settings);
 
   // Civil date drives the zmanim; halachic date (rolls at Shkia) drives date, inserts, fasts
   const civilKey = dateKeyInTz(now, tz);
@@ -365,7 +414,7 @@ function computeBoard({ hebcal, now, tz, settings, dynamicRules, weekdayRules, s
   out.hDate = (hEvs.find(e => e.category === 'hebdate' || e.category === 'hebrew') || {}).hebrew || '';
   out.daf = (evs(civilKey).find(e => e.category === 'dafyomi') || {}).hebrew || ''; // Daf follows the civil day
   const omerKey = settings.omerRollover === 'shkia' ? hKey : (afterTzeis ? tomorrowKey : civilKey);
-  out.omer = (evs(omerKey).find(e => e.category === 'omer') || {}).hebrew || '';
+  out.omer = omerText(omerDayOf(omerKey), nusach);
 
   const inserts = [];
   if (hEvs.some(e => e.category === 'roshchodesh')) inserts.push("יעלה ויבוא (ראש חודש)");
@@ -375,38 +424,50 @@ function computeBoard({ hebcal, now, tz, settings, dynamicRules, weekdayRules, s
 
   out.inserts = inserts;
 
-  /* ---------- Seasonal tefillah: always shows which version to say ---------- */
-  const MASHIV = "משיב הרוח ומוריד הגשם", MORID = "מוריד הטל";
-  const VTEN = "ותן טל ומטר לברכה", BORCHEINU = "ברכנו";
+  /* ---------- Seasonal tefillah: wording follows the shul's nusach ---------- */
+  const W = BIRKAS_HASHANIM[nusach];
+  // Ashkenaz in Chutz Laaretz says nothing in the summer (no מוריד הטל)
+  const silentSummer = nusach === 'ashkenaz' && !il;
   const seasonalCfg = seasonal || {};
+  const hd = hdOfKey(hKey), hm = hd.getMonth(), hdDay = hd.getDate();
+  let mashivRow, vtenRow;
+
   if (seasonalCfg.mode === 'manual') {
-    out.seasonal = [
-      { text: seasonalCfg.mashivHaruach ? MASHIV : MORID },
-      { text: seasonalCfg.vtenTal ? VTEN : BORCHEINU }
-    ];
+    mashivRow = seasonalCfg.mashivHaruach ? { text: MASHIV_TEXT } : (silentSummer ? null : { text: MORID_TEXT });
+    vtenRow = { text: seasonalCfg.vtenTal ? W.winter : W.summer };
   } else {
-    const hd = hdOfKey(hKey), hm = hd.getMonth(), hdDay = hd.getDate();
-    let mashivRow;
-    if (hm === months.TISHREI && hdDay === 22) mashivRow = { text: MASHIV, note: 'מתחילים במוסף', highlight: true };
-    else if (hm === months.NISAN && hdDay === 15) mashivRow = { text: MORID, note: 'מתחילים במוסף', highlight: true };
-    else mashivRow = { text: mashivOn(hKey) ? MASHIV : MORID };
+    if (hm === months.TISHREI && hdDay === 22) {
+      mashivRow = { text: MASHIV_TEXT, note: 'מתחילים במוסף', highlight: true };
+    } else if (hm === months.NISAN && hdDay === 15) {
+      mashivRow = silentSummer
+        ? { text: 'מפסיקים משיב הרוח', note: 'במוסף', highlight: true }
+        : { text: MORID_TEXT, note: 'מתחילים במוסף', highlight: true };
+    } else if (mashivOn(hKey)) {
+      mashivRow = { text: MASHIV_TEXT };
+    } else if (silentSummer) {
+      // A gentle reminder for the first month after Pesach, then the row is hidden
+      const earlySummer = (hm === months.NISAN && hdDay > 15) || (hm === months.IYYAR && hdDay <= 15);
+      mashivRow = earlySummer ? { text: 'אין אומרים מוריד הטל' } : null;
+    } else {
+      mashivRow = { text: MORID_TEXT };
+    }
 
     const prevKey = addDays(hKey, -1);
     const vtenToday = vtenOn(hKey, il);
-    let vtenRow;
+    const chatzot = T(civilKey, 'chatzot');
     if (vtenToday && !vtenOn(prevKey, il)) {
-      vtenRow = { text: VTEN, note: 'מתחילים במעריב', highlight: true };
+      vtenRow = { text: W.winter, note: 'מתחילים במעריב', highlight: true };
     } else if (vtenToday) {
-      vtenRow = { text: VTEN };
+      vtenRow = { text: W.winter };
     } else if (vtenOn(prevKey, il)) {
-      vtenRow = { text: BORCHEINU, note: 'מפסיקים ותן טל ומטר', highlight: true };
-    } else if (hKey === civilKey && vtenOn(tomorrowKey, il) && T(civilKey, 'chatzot') && now >= T(civilKey, 'chatzot')) {
-      vtenRow = { text: BORCHEINU, note: 'הערב במעריב: ותן טל ומטר', highlight: true };
+      vtenRow = { text: W.summer, note: `מפסיקים ${W.short}`, highlight: true };
+    } else if (hKey === civilKey && vtenOn(tomorrowKey, il) && chatzot && now >= chatzot) {
+      vtenRow = { text: W.summer, note: `הערב במעריב: ${W.short}`, highlight: true };
     } else {
-      vtenRow = { text: BORCHEINU };
+      vtenRow = { text: W.summer };
     }
-    out.seasonal = [mashivRow, vtenRow];
   }
+  out.seasonal = [mashivRow, vtenRow].filter(Boolean);
 
   /* ---------- Weekday dynamic minyanim ---------- */
   const dow = dowOfKey(civilKey);
@@ -517,8 +578,8 @@ function computeBoard({ hebcal, now, tz, settings, dynamicRules, weekdayRules, s
     }));
     const yomTovEv = pKeys.map(k => evs(k).find(e => e.yomtov === true)).find(Boolean);
     const title = parshaEv ? parshaEv.hebrew : (specials.shift() || '');
-    const haftarahEng = (parshaEv && parshaEv.leyning && parshaEv.leyning.haftarah)
-      || (yomTovEv && yomTovEv.leyning && yomTovEv.leyning.haftarah) || '';
+    const pickHaftarah = (lp) => (lp ? ((nusach === 'edot' && lp.haftarah_sephardic) || lp.haftarah) : null);
+    const haftarahEng = pickHaftarah(parshaEv && parshaEv.leyning) || pickHaftarah(yomTovEv && yomTovEv.leyning) || '';
 
     // Candle lighting - Hebcal's own events (correct for 2nd night Yom Tov, Yom Tov into Shabbos)
     const candles = [];
@@ -746,14 +807,14 @@ const App = () => {
   );
 
   /* ---------- Heartbeat to Admin ---------- */
-  let tvStatus = 'OK', tvMessage = `Rendering for ${loc ? loc.name || `${loc.latitude}, ${loc.longitude}` : ''} (${il ? 'Israel' : 'Diaspora'})`;
+  let tvStatus = 'OK', tvMessage = `Rendering for ${loc ? loc.name || `${loc.latitude}, ${loc.longitude}` : ''} (${il ? 'Eretz Yisrael' : 'Chutz Laaretz'})`;
   if (!loc) { tvStatus = 'ERROR'; tvMessage = locError ? `No location: ${locError}` : 'No location set - choose the shul location in the admin panel.'; }
   else if (calc.error) { tvStatus = 'ERROR'; tvMessage = `Calendar calculation failed: ${calc.error}`; }
   else if (!board.hasToday) { tvStatus = 'ERROR'; tvMessage = `No zmanim for ${civilKey}`; }
   else if (simActive) { tvStatus = 'SIMULATION'; tvMessage = `Simulating ${sim.date} ${sim.time || ''}`; }
 
   const beatRef = useRef({});
-  beatRef.current = { status: tvStatus, message: tvMessage, activeDate: civilKey, location: loc ? `${loc.name || ''} (${il ? 'Israel' : 'Diaspora'})` : '' };
+  beatRef.current = { status: tvStatus, message: tvMessage, activeDate: civilKey, location: loc ? `${loc.name || ''} (${il ? 'Eretz Yisrael' : 'Chutz Laaretz'})` : '' };
   const sendBeat = useCallback(() => {
     set(ref(db, 'system_logs/tv_status'), {
       ...beatRef.current,
@@ -762,15 +823,35 @@ const App = () => {
     }).catch(() => { /* offline - will retry */ });
   }, []);
 
+  const [fbConnected, setFbConnected] = useState(false);
   useEffect(() => {
     const unsub = onValue(ref(db, '.info/connected'), (snap) => {
-      if (snap.val() === true) {
-        onDisconnect(ref(db, 'system_logs/tv_status')).update({ status: 'OFFLINE', message: 'TV lost its connection to Firebase' });
+      const connected = snap.val() === true;
+      setFbConnected(connected);
+      if (connected) {
+        onDisconnect(ref(db, 'system_logs/tv_status')).update({ status: 'OFFLINE', message: 'Screen lost its connection to Firebase' });
         sendBeat();
       }
     });
     return () => unsub();
   }, [sendBeat]);
+
+  /* ---------- Nightly refresh ----------
+     Reloads once between 3:00 and 3:10 AM (shul time) to keep long-running
+     browsers fresh. Only reloads when the site is reachable, so an internet
+     outage can never leave the screen on an error page. */
+  const bootedAt = useRef(Date.now());
+  useEffect(() => {
+    const p = tzParts(realTime, tz);
+    if (p.hour !== 3 || p.minute > 10) return undefined;
+    if (Date.now() - bootedAt.current < 2 * 3600000) return undefined; // already fresh (also prevents loops)
+    if (!navigator.onLine || !fbConnected) return undefined;
+    let cancelled = false;
+    fetch(window.location.href, { method: 'HEAD', cache: 'no-store' })
+      .then((res) => { if (!cancelled && res.ok) window.location.reload(); })
+      .catch(() => { /* site unreachable - try again next minute */ });
+    return () => { cancelled = true; };
+  }, [realTime, tz, fbConnected]);
 
   useEffect(() => {
     sendBeat();
@@ -845,7 +926,11 @@ const App = () => {
           margin: 0; padding: 0; overflow: hidden;
           font-family: '${fontFamily}', sans-serif;
           background-color: #000;
+          -webkit-user-select: none; user-select: none;
+          -webkit-tap-highlight-color: transparent;
         }
+        /* Kiosk: no mouse pointer or text selection on the screen */
+        html, body, body * { cursor: none !important; }
 
         .dark-mode { --bg-main: #000000; --bg-panel: #111111; --bg-center: #0a0a0a; --bg-row: #1a1a1a; --text-main: #ffffff; --text-sec: #aaaaaa; --text-row: #dddddd; --border: #333333; --border-panel: #222222; --accent: #f1c40f; --ticker-bg: #0d47a1; }
         .light-mode { --bg-main: #e9ecef; --bg-panel: #ffffff; --bg-center: #f8f9fa; --bg-row: #f1f3f5; --text-main: #212529; --text-sec: #495057; --text-row: #343a40; --border: #ced4da; --border-panel: #dee2e6; --accent: #d35400; --ticker-bg: #1565c0; }
@@ -956,7 +1041,7 @@ const App = () => {
             {board.chanukahTonight > 0 && (
               <div style={{ backgroundColor: 'var(--bg-row)', padding: '0.8vh 1vh', borderRadius: '6px', textAlign: 'center', marginBottom: '1vh', border: '1px solid var(--accent)' }}>
                 <h4 style={{ color: 'var(--accent)', fontSize: '1.9vh', margin: '0 0 1.8vh 0', fontWeight: '900' }}>
-                  {board.chanukahTonight === 1 ? "חנוכה -  נר ראשון" : `חנוכה - ליל ${['', '', 'ב׳', 'ג׳', 'ד׳', 'ה׳', 'ו׳', 'ז׳', 'ח׳'][board.chanukahTonight]} נרות`}
+                  {board.chanukahTonight === 1 ? "חנוכה -  נר ראשון" : `ליל חנוכה  ${['', '', 'ב׳', 'ג׳', 'ד׳', 'ה׳', 'ו׳', 'ז׳', 'ח׳'][board.chanukahTonight]} נרות`}
                 </h4>
                 {/* Laid out left-to-right so the first night's candle is on the right, as it is lit */}
                 <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'flex-end', gap: '0.8vw', height: '3.8vh', direction: 'ltr' }}>
@@ -1013,7 +1098,7 @@ const App = () => {
               </div>
             ) : (
               <div style={{ textAlign: 'center', marginTop: '5vh', color: 'var(--text-sec)' }}>
-                {!loc ? 'No location has been set' : 'Loading Zemanim...'}
+                {!loc ? 'לא הוגדר מיקום לבית הכנסת' : 'טוען זמנים...'}
               </div>
             )}
             </div>
@@ -1027,7 +1112,7 @@ const App = () => {
                 <div className="panel-header" style={{ fontSize: '4vh', paddingBottom: '0.5vh', marginBottom: '1vh' }}>ימי החול</div>
                 <div style={{ display: 'flex', flexDirection: 'column', flex: 1 }}>
                   {displayWeekdayMinyanim.length === 0 ? (
-                    <div style={{ textAlign: 'center', color: 'var(--text-sec)', marginTop: '2vh' }}> זמני תפילה are not set</div>
+                    <div style={{ textAlign: 'center', color: 'var(--text-sec)', marginTop: '2vh' }}>אין זמני תפילה מוגדרים</div>
                   ) : (
                     displayWeekdayMinyanim.map((minyan) => (
                       <div key={minyan.id} className="minyan-row">
@@ -1073,7 +1158,12 @@ const App = () => {
             {(displayDaf || displayOmer) && (
               <div style={{ marginBottom: '1vh' }}>
                 {displayDaf && <div className="compact-row"><span>דף היומי:</span><span style={{ fontWeight: 'bold', color: theme === 'light' ? '#1565c0' : '#64b5f6' }}>{displayDaf}</span></div>}
-                {displayOmer && <div className="compact-row"><span>ספירת העומר:</span><span style={{ fontWeight: 'bold', color: theme === 'light' ? '#e65100' : '#ffb74d' }}>{displayOmer}</span></div>}
+                {displayOmer && (
+                  <div className="compact-row" style={{ flexDirection: 'column', alignItems: 'stretch', gap: '0.3vh' }}>
+                    <span>ספירת העומר:</span>
+                    <span style={{ fontWeight: 'bold', textAlign: 'center', color: theme === 'light' ? '#e65100' : '#ffb74d' }}>{displayOmer}</span>
+                  </div>
+                )}
               </div>
             )}
             <div style={{ backgroundColor: 'var(--border-panel)', textAlign: 'center', padding: '1vh', borderRadius: '6px', marginBottom: '1vh' }}>
