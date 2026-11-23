@@ -664,6 +664,17 @@ function computeBoard({ hebcal, now, tz, settings, dynamicRules, weekdayRules, s
 }
 
 /* =====================================================================
+   TICKER DIRECTION: decided by the first letter, like dir="auto"
+   ===================================================================== */
+const isRtlText = (text) => {
+  for (const ch of String(text || '')) {
+    if (/[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]/.test(ch)) return true;  // Hebrew, Arabic
+    if (/[A-Za-z\u00C0-\u024F\u0400-\u04FF]/.test(ch)) return false;           // Latin, Cyrillic
+  }
+  return true; // no letters (e.g. only numbers): treat as Hebrew, the board's language
+};
+
+/* =====================================================================
    AUTO-FIT: shrinks a panel's contents just enough that nothing is cut
    off when extra boxes (fast, Chanukah, reminders) appear
    ===================================================================== */
@@ -865,20 +876,43 @@ const App = () => {
     if (!d) return ["אין הודעות חדשות"];
     return typeof d === 'string' ? [d] : Object.values(d);
   }, [tickerNode.value]);
+  // One announcement at a time, each scrolling in its own language's direction:
+  // Hebrew moves left -> right (its start, on the right, enters first); English moves right -> left.
   const tickerRef = useRef(null);
-  const [tickerDuration, setTickerDuration] = useState(25);
+  const [tickerIdx, setTickerIdx] = useState(0);
+  const [tickerRun, setTickerRun] = useState(0); // bumps to restart (also when one message repeats)
+  const tickerMsg = tickerMessages[tickerIdx % tickerMessages.length];
+  const tickerRtl = isRtlText(tickerMsg);
+
   useLayoutEffect(() => {
-    const measure = () => {
-      const el = tickerRef.current;
-      if (!el) return;
-      const pxPerSec = Math.max(60, window.innerHeight * 0.12);
-      setTickerDuration(Math.max(10, (el.scrollWidth + window.innerWidth) / pxPerSec));
+    const el = tickerRef.current;
+    if (!el) return undefined;
+    const vw = window.innerWidth;
+    const w = el.scrollWidth;
+    const advance = () => {
+      setTickerIdx(i => (i + 1) % Math.max(1, tickerMessages.length));
+      setTickerRun(r => r + 1);
     };
-    measure();
-    if (document.fonts && document.fonts.ready) document.fonts.ready.then(measure);
-    window.addEventListener('resize', measure);
-    return () => window.removeEventListener('resize', measure);
-  }, [tickerMessages, fontFamily]);
+    const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduceMotion || typeof el.animate !== 'function') {
+      // No scrolling: show each announcement centered for 10 seconds
+      el.style.transform = `translate(${Math.max(0, (vw - w) / 2)}px, -50%)`;
+      const id = setTimeout(advance, 10000);
+      return () => clearTimeout(id);
+    }
+    const pxPerSec = Math.max(60, window.innerHeight * 0.12);
+    const duration = ((w + vw) / pxPerSec) * 1000;
+    const from = tickerRtl ? `translate(${-w}px, -50%)` : `translate(${vw}px, -50%)`;
+    const to = tickerRtl ? `translate(${vw}px, -50%)` : `translate(${-w}px, -50%)`;
+    const anim = el.animate([{ transform: from }, { transform: to }], { duration, easing: 'linear', fill: 'both' });
+    anim.onfinish = advance;
+    return () => { anim.onfinish = null; anim.cancel(); };
+  }, [tickerRun, tickerMsg, tickerRtl, fontFamily, tickerMessages.length]);
+
+  // Restart once web fonts finish loading, so the width (and speed) is measured correctly
+  useEffect(() => {
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => setTickerRun(r => r + 1));
+  }, [fontFamily]);
 
   /* ---------- Minyan lists ---------- */
   const displayWeekdayMinyanim = [...toList(manualNode.value), ...(board.weekdayDynamic || [])]
@@ -969,16 +1003,12 @@ const App = () => {
         .compact-row .val { direction: ltr; font-weight: 700; color: var(--text-main); }
 
         .ticker-wrap { height: 10vh; background-color: var(--ticker-bg); color: #fff; overflow: hidden; white-space: nowrap; position: relative; }
-        .ticker { position: absolute; left: 0; top: 50%; display: inline-block; white-space: nowrap; direction: rtl; font-size: 4vh; font-weight: 700; animation-name: ticker-scroll-rtl; animation-timing-function: linear; animation-iteration-count: infinite; }
-        .ticker-item { margin: 0 4vw; }
-        /* Hebrew reads right-to-left, so text travels left -> right and the start of each message appears first */
-        @keyframes ticker-scroll-rtl { from { transform: translate(-100%, -50%); } to { transform: translate(100vw, -50%); } }
+        .ticker { position: absolute; left: 0; top: 50%; display: inline-block; white-space: nowrap; font-size: 4vh; font-weight: 700; transform: translate(100vw, -50%); will-change: transform; }
 
         @keyframes flame-flicker {
           0%, 100% { transform: translateX(-50%) scale(1); opacity: 0.85; }
           50% { transform: translateX(-50%) scale(1.1) translateY(-2px); opacity: 1; }
         }
-        @media (prefers-reduced-motion: reduce) { .ticker { animation-duration: 0s !important; transform: translate(0, -50%); } }
       `}</style>
 
       {mainBg && (
@@ -1018,7 +1048,7 @@ const App = () => {
           {/* ===== LEFT: TODAY ===== */}
           <div className="panel" style={{ padding: '2vh 1vw' }}>
             <div className="panel-fit" ref={todayFitRef}>
-            <div className="panel-header">זמני היום</div>
+            <div className="panel-header">זמנים להיום</div>
 
             {board.fast && (
               <div style={{ backgroundColor: '#311b92', padding: '1vh', borderRadius: '6px', textAlign: 'center', marginBottom: '1.5vh', border: '1px solid #5e35b1' }}>
@@ -1041,7 +1071,7 @@ const App = () => {
             {board.chanukahTonight > 0 && (
               <div style={{ backgroundColor: 'var(--bg-row)', padding: '0.8vh 1vh', borderRadius: '6px', textAlign: 'center', marginBottom: '1vh', border: '1px solid var(--accent)' }}>
                 <h4 style={{ color: 'var(--accent)', fontSize: '1.9vh', margin: '0 0 1.8vh 0', fontWeight: '900' }}>
-                  {board.chanukahTonight === 1 ? "חנוכה -  נר ראשון" : `ליל חנוכה  ${['', '', 'ב׳', 'ג׳', 'ד׳', 'ה׳', 'ו׳', 'ז׳', 'ח׳'][board.chanukahTonight]} נרות`}
+                  {board.chanukahTonight === 1 ? "חנוכה - הערב נר ראשון" : `חנוכה - הערב ${['', '', 'ב׳', 'ג׳', 'ד׳', 'ה׳', 'ו׳', 'ז׳', 'ח׳'][board.chanukahTonight]} נרות`}
                 </h4>
                 {/* Laid out left-to-right so the first night's candle is on the right, as it is lit */}
                 <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'flex-end', gap: '0.8vw', height: '3.8vh', direction: 'ltr' }}>
@@ -1200,9 +1230,7 @@ const App = () => {
         </main>
 
         <footer className="ticker-wrap">
-          <div className="ticker" ref={tickerRef} style={{ animationDuration: `${tickerDuration}s` }}>
-            {tickerMessages.map((msg, idx) => (<span key={idx} className="ticker-item">• {msg} </span>))}
-          </div>
+          <div className="ticker" ref={tickerRef} dir={tickerRtl ? 'rtl' : 'ltr'}>{tickerMsg}</div>
         </footer>
       </div>
     </>
